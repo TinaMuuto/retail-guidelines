@@ -1,34 +1,41 @@
 import streamlit as st
 import pandas as pd
 from pptx import Presentation
-from pptx.util import Pt
 from PIL import Image
 import io
+import os
 import re
+import requests
+import unicodedata
 from typing import List, Dict, Any, Tuple
 from collections import defaultdict
-import requests
-import os
-import unicodedata
 
-# ---------------------------------
-# KONSTANTER
-# ---------------------------------
+# ==============================
+# Konstanter
+# ==============================
 
 TEMPLATE_FILENAME = "input-template.pptx"
 
-# Google Sheets (kan være CSV eller XLSX via public export)
-LIBRARY_DEFAULT_URL = "https://docs.google.com/spreadsheets/d/1h3yaq094mBa5Yadfi9Nb_Wrnzj3gIH2DviIfU0DdwsQ/export?format=csv&gid=437866492"
-MASTER_DEFAULT_URL  = "https://docs.google.com/spreadsheets/d/1blj42SbFpszWGyOrDOUwyPDJr9K1NGpTMX6eZTbt_P4/export?format=csv&gid=194572316"
+# Library (kan være CSV/XLSX); behold din nuværende hvis du har en fast kilde
+LIBRARY_DEFAULT_URL = (
+    "https://docs.google.com/spreadsheets/d/1h3yaq094mBa5Yadfi9Nb_Wrnzj3gIH2DviIfU0DdwsQ"
+    "/export?format=csv&gid=437866492"
+)
 
-# pCon kolonneindeks og parsing
+# Master-data: BRUG CSV-EXPORT-LINK (ikke edit-link)
+MASTER_DEFAULT_URL = (
+    "https://docs.google.com/spreadsheets/d/1blj42SbFpszWGyOrDOUwyPDJr9K1NGpTMX6eZTbt_P4"
+    "/export?format=csv&gid=1152340088"
+)
+
+# pCon-format
 PCON_ARTICLE_NO_COL   = 17
 PCON_QUANTITY_COL     = 30
 PCON_SHORT_TEXT_COL   = 2
 PCON_VARIANT_TEXT_COL = 4
 PCON_SKIPROWS         = 2
 
-# Placeholders i skabelon
+# Placeholders i skabelonen
 PRODUCT_PLACEHOLDERS   = [f"{{{{PRODUCT DESCRIPTION {i}}}}}" for i in range(1, 13)]
 PACKSHOT_PLACEHOLDERS  = [f"{{{{ProductPackshot{i}}}}}" for i in range(1, 13)]
 ACCESSORY_PLACEHOLDERS = [f"{{{{accessory{i}}}}}" for i in range(1, 7)]
@@ -44,13 +51,11 @@ SETTING_TEXT_TAGS = [
 RENDERING_TAG   = "{{Rendering}}"
 LINEDRAWING_TAG = "{{Linedrawing}}"
 
-# Masterdata packshot-kolonne (kanonisk navn efter mapping)
-MASTER_DATA_PACKSHOT_COL = "IMAGE URL"
+MASTER_DATA_PACKSHOT_COL = "IMAGE URL"  # kanonisk navn efter mapping
 
-
-# ---------------------------------
-# HJÆLPERE: Kolonnenavne og robust indlæsning
-# ---------------------------------
+# ==============================
+# Hjælpere: kolonnemapping og indlæsning
+# ==============================
 
 def _norm_header(s: str) -> str:
     if s is None:
@@ -66,9 +71,9 @@ def _build_colmap(cols, synonyms: Dict[str, list]) -> Dict[str, str]:
     for canonical, alts in synonyms.items():
         found = None
         for alt in [canonical] + alts:
-            key = _norm_header(alt)
-            if key in norm_lookup:
-                found = norm_lookup[key]
+            k = _norm_header(alt)
+            if k in norm_lookup:
+                found = norm_lookup[k]
                 break
         if found:
             colmap[canonical] = found
@@ -106,28 +111,26 @@ def load_lookup_table(url_or_path: str, required: Dict[str, list], source_name: 
 
     if df is None or df.empty:
         st.error(f"{source_name}: kunne ikke parse som CSV/XLSX. Fejl: {', '.join(read_errors)}")
-        st.info("Tip: Publicer Google Sheet som CSV, eller brug en gyldig XLSX/CSV-kilde.")
+        st.info("Publicér arket og brug /export?format=csv&gid=… eller upload XLSX.")
         raise ValueError(f"{source_name}: tom eller ukendt format")
 
     colmap = _build_colmap(df.columns, required)
     missing = [c for c in required.keys() if c not in colmap]
     if missing:
         st.error(f"{source_name}: mangler kolonner: {', '.join(missing)}")
-        st.caption("Tilgængelige kolonner i kilden:")
+        st.caption("Tilgængelige kolonner:")
         st.code(", ".join(map(str, df.columns)))
         raise ValueError(f"{source_name}: manglende kolonner")
 
     df = df.rename(columns=colmap)
-
     for key in ("EUR ITEM NO.", "ITEM NO."):
         if key in df.columns:
             df[key] = df[key].astype(str).str.strip()
     return df
 
-
-# ---------------------------------
-# pCon parsing og match-logik
-# ---------------------------------
+# ==============================
+# pCon parsing og match
+# ==============================
 
 @st.cache_data
 def load_pcon_file(uploaded_file) -> pd.DataFrame:
@@ -136,11 +139,11 @@ def load_pcon_file(uploaded_file) -> pd.DataFrame:
     else:
         df = pd.read_excel(uploaded_file, skiprows=PCON_SKIPROWS, engine="openpyxl")
 
-    required_indices = [PCON_SHORT_TEXT_COL, PCON_VARIANT_TEXT_COL, PCON_ARTICLE_NO_COL, PCON_QUANTITY_COL]
-    if df.shape[1] <= max(required_indices):
-        raise ValueError("Utilstrækkeligt antal kolonner i pCon-filen.")
+    required_idx = [PCON_SHORT_TEXT_COL, PCON_VARIANT_TEXT_COL, PCON_ARTICLE_NO_COL, PCON_QUANTITY_COL]
+    if df.shape[1] <= max(required_idx):
+        raise ValueError("pCon-filen har for få kolonner.")
 
-    sub = df.iloc[:, required_indices].copy()
+    sub = df.iloc[:, required_idx].copy()
     sub.columns = ["SHORT_TEXT", "VARIANT_TEXT", "ARTICLE_NO", "QUANTITY"]
     sub["ARTICLE_NO"] = sub["ARTICLE_NO"].astype(str).str.strip()
     sub["SHORT_TEXT"] = sub["SHORT_TEXT"].astype(str).str.strip()
@@ -161,7 +164,6 @@ def match_library(row: pd.Series, library_df: pd.DataFrame) -> Dict[str, Any]:
             pass
         else:
             return hit.iloc[0].to_dict()
-
     key = fallback_key(article_no)
     if key:
         alt = library_df[library_df["EUR ITEM NO."].apply(fallback_key) == key]
@@ -174,7 +176,6 @@ def match_master(row: pd.Series, master_df: pd.DataFrame) -> Dict[str, Any]:
     hit = master_df[master_df["ITEM NO."] == article_no]
     if not hit.empty:
         return hit.iloc[0].to_dict()
-
     key = fallback_key(article_no)
     if key:
         alt = master_df[master_df["ITEM NO."].apply(fallback_key) == key]
@@ -182,36 +183,33 @@ def match_master(row: pd.Series, master_df: pd.DataFrame) -> Dict[str, Any]:
             return alt.iloc[0].to_dict()
     return {}
 
-def line_text_from_pcon_and_library(row: pd.Series, library_match: Dict[str, Any]) -> str:
-    if library_match and "PRODUCT" in library_match and str(library_match["PRODUCT"]).strip():
-        return str(library_match["PRODUCT"]).strip()
-    short_text = str(row["SHORT_TEXT"]).strip()
-    variant_text = str(row["VARIANT_TEXT"]).strip()
-    if not variant_text or variant_text.upper() == "LIGHT OPTION: OFF":
-        return short_text
-    return f"{short_text} – {variant_text}"
+def line_text(row: pd.Series, lib: Dict[str, Any]) -> str:
+    if lib and "PRODUCT" in lib and str(lib["PRODUCT"]).strip():
+        return str(lib["PRODUCT"]).strip()
+    stxt = str(row["SHORT_TEXT"]).strip()
+    vtxt = str(row["VARIANT_TEXT"]).strip()
+    if not vtxt or vtxt.upper() == "LIGHT OPTION: OFF":
+        return stxt
+    return f"{stxt} – {vtxt}"
 
 def build_products(pcon_df: pd.DataFrame, library_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[str, List[Dict[str, Any]], List[str]]:
     warnings = []
     if MASTER_DATA_PACKSHOT_COL not in master_df.columns:
-        warnings.append(f"Kolonnen '{MASTER_DATA_PACKSHOT_COL}' mangler i Master Data. Packshots bliver tomme.")
+        warnings.append(f"Mangler kolonne '{MASTER_DATA_PACKSHOT_COL}' i Master Data.")
 
-    product_lines = []
+    lines = []
     details = []
 
     for _, row in pcon_df.iterrows():
         qty = int(row["QUANTITY"]) if pd.notna(row["QUANTITY"]) and str(row["QUANTITY"]).strip() else 1
         lib = match_library(row, library_df)
         mst = match_master(row, master_df)
-        desc = line_text_from_pcon_and_library(row, lib)
+        desc = line_text(row, lib)
 
-        # Inkludér artikelnummer i linjen
-        line = f"{qty} X {desc} – {row['ARTICLE_NO']}"
-        product_lines.append(line)
-
+        lines.append(f"{qty} X {desc} – {row['ARTICLE_NO']}")
         packshot_url = mst.get(MASTER_DATA_PACKSHOT_COL, "") if MASTER_DATA_PACKSHOT_COL in master_df.columns else ""
         if not packshot_url and mst:
-            warnings.append(f"Mangler packshot URL i Master Data for {row['ARTICLE_NO']}")
+            warnings.append(f"Packshot-URL mangler i Master Data for {row['ARTICLE_NO']}")
 
         details.append({
             "description": desc,
@@ -221,18 +219,16 @@ def build_products(pcon_df: pd.DataFrame, library_df: pd.DataFrame, master_df: p
         })
 
         if not lib:
-            warnings.append(f"Ingen Library-match for artikel {row['ARTICLE_NO']}. Bruger pCon-tekst.")
+            warnings.append(f"Ingen Library-match for {row['ARTICLE_NO']} – bruger pCon-tekst.")
 
-    def sort_key(s: str) -> str:
+    def _sort_key(s: str) -> str:
         return s.split(" X ", 1)[-1].lower()
 
-    product_lines_sorted = sorted(product_lines, key=sort_key)
-    return "\n".join(product_lines_sorted), details, warnings
+    return "\n".join(sorted(lines, key=_sort_key)), details, warnings
 
-
-# ---------------------------------
-# BILLEDER
-# ---------------------------------
+# ==============================
+# Billeder
+# ==============================
 
 @st.cache_data(ttl=3600)
 def fetch_image(url: str) -> bytes | None:
@@ -261,10 +257,9 @@ def preprocess_image(img_bytes: bytes, max_side: int = 1200, quality: int = 85) 
     except Exception:
         return img_bytes
 
-
-# ---------------------------------
-# POWERPOINT HJÆLPERE
-# ---------------------------------
+# ==============================
+# PowerPoint helpers
+# ==============================
 
 def find_shape_by_tag(slide, tag: str):
     tag_u = tag.strip().upper()
@@ -287,19 +282,16 @@ def fit_replace_text(shape, value: str):
         return
     v = "" if value is None else str(value)
     tf = shape.text_frame
-
     if not tf.paragraphs:
         p = tf.add_paragraph()
     else:
         p = tf.paragraphs[0]
     if not p.runs:
         p.add_run()
-
     tmpl = p.runs[0]
     font_name = tmpl.font.name
     font_size = tmpl.font.size
     font_bold = tmpl.font.bold
-
     for para in list(tf.paragraphs):
         for run in list(para.runs):
             run.text = ""
@@ -317,28 +309,23 @@ def replace_image(slide, tag: str, image_bytes: bytes, crop_to_frame: bool = Fal
     if ph is None:
         return
     left, top, width, height = ph.left, ph.top, ph.width, ph.height
-
     try:
         try:
             sp = ph.element
             sp.getparent().remove(sp)
         except Exception:
             pass
-
         stream = io.BytesIO(image_bytes)
         pic = slide.shapes.add_picture(stream, left, top, width=width, height=height)
 
         img = Image.open(io.BytesIO(image_bytes))
         img_w, img_h = img.size
         frame_w, frame_h = width.emu, height.emu
-
         w_ratio = frame_w / img_w
         h_ratio = frame_h / img_h
         scale = max(w_ratio, h_ratio) if crop_to_frame else min(w_ratio, h_ratio)
-
         new_w = int(img_w * scale)
         new_h = int(img_h * scale)
-
         pic.width = new_w
         pic.height = new_h
         pic.left = left + (width - pic.width) // 2
@@ -352,7 +339,6 @@ def replace_image(slide, tag: str, image_bytes: bytes, crop_to_frame: bool = Fal
             pic.crop_top = max(0, off_y)
             pic.crop_bottom = max(0, off_y)
             pic.left, pic.top, pic.width, pic.height = left, top, width, height
-
     except Exception as e:
         st.warning(f"Kunne ikke indsætte billede for '{tag}': {e}")
 
@@ -362,18 +348,36 @@ def find_first_slide_with_tag(prs: Presentation, tag: str) -> Tuple[Any, int]:
         for shp in slide.shapes:
             if getattr(shp, "has_text_frame", False) and shp.text_frame and shp.text_frame.text.strip().upper() == tag_u:
                 return slide, i
-    raise ValueError(f"Skabelonen mangler en slide med placeholder-tekst: {tag}")
+    raise ValueError(f"Skabelonen mangler en slide med placeholder: {tag}")
 
 def fill_overview_slides(prs: Presentation, renderings: List[bytes]) -> int:
     if not renderings:
         return 0
+
+    # Fallback-detektor: findes Rendering1 i skabelonen?
+    has_grid = False
+    for slide in prs.slides:
+        for shp in slide.shapes:
+            if getattr(shp, "has_text_frame", False) and shp.text_frame:
+                if "Rendering1" in shp.text_frame.text:
+                    has_grid = True
+                    break
+        if has_grid:
+            break
+
     overview_slide, overview_idx = find_first_slide_with_tag(prs, "OVERVIEW")
     layout = overview_slide.slide_layout
+
+    if not has_grid:
+        # Brug enkelt placeholder {{Rendering}} hvis grid mangler
+        s = prs.slides.add_slide(layout)
+        replace_image(s, RENDERING_TAG, preprocess_image(renderings[0]), crop_to_frame=True)
+        prs.slides._sldIdLst.remove(prs.slides._sldIdLst[overview_idx])
+        return 1
 
     n = len(renderings)
     groups = (n + 11) // 12
     created = 0
-
     for i in range(groups):
         s = prs.slides.add_slide(layout)
         created += 1
@@ -396,7 +400,6 @@ def fill_setting_slides(
 ) -> int:
     if not settings:
         return 0
-
     template_slide, template_idx = find_first_slide_with_tag(prs, "{{SETTINGNAME}}")
     layout = template_slide.slide_layout
     total = 0
@@ -405,7 +408,6 @@ def fill_setting_slides(
         setting_name = setting["name"]
         pcon_df = load_pcon_file(setting["pcon_file"])
         product_text, product_details, warnings = build_products(pcon_df, library_df, master_df)
-
         for w in warnings:
             st.warning(f"[{setting_name}] {w}")
 
@@ -432,8 +434,9 @@ def fill_setting_slides(
                 if setting.get("linedrawing_bytes"):
                     replace_image(s, LINEDRAWING_TAG, preprocess_image(setting["linedrawing_bytes"]))
 
+                # Tøm accessories
                 for tag in ACCESSORY_PLACEHOLDERS:
-                    fit_replace_text(find_shape_by_tag(s, f"{{{{{tag}}}}}"), "")
+                    fit_replace_text(find_shape_by_tag(s, tag), "")
             else:
                 fit_replace_text(find_shape_by_tag(s, "{{SETTINGSUBHEADLINE}}"), "")
                 fit_replace_text(find_shape_by_tag(s, "{{SettingDimensions}}"), "")
@@ -443,36 +446,42 @@ def fill_setting_slides(
             start, end = page * 12, min((page + 1) * 12, n)
             chunk = product_details[start:end]
             for idx, prod in enumerate(chunk):
-                prod_tag = PRODUCT_PLACEHOLDERS[idx]
-                fit_replace_text(find_shape_by_tag(s, prod_tag), prod["description"])
-
-                ps_tag = PACKSHOT_PLACEHOLDERS[idx]
+                fit_replace_text(find_shape_by_tag(s, PRODUCT_PLACEHOLDERS[idx]), prod["description"])
                 if prod.get("packshot_url"):
                     raw = fetch_image(prod["packshot_url"])
                     if raw:
-                        replace_image(s, f"{{{{{ps_tag}}}}}", preprocess_image(raw))
+                        replace_image(s, PACKSHOT_PLACEHOLDERS[idx], preprocess_image(raw))
 
     prs.slides._sldIdLst.remove(prs.slides._sldIdLst[template_idx])
     return total
 
-
-# ---------------------------------
-# GRUPPERING AF UPLOADS
-# ---------------------------------
+# ==============================
+# Gruppering af uploads
+# ==============================
 
 def group_uploaded_files(uploaded_files: List[io.BytesIO]) -> Dict[str, Dict[str, Any]]:
     groups = defaultdict(lambda: {"csv": None, "rendering": None, "floorplan": None, "name": None})
 
     for f in uploaded_files:
         fname = f.name
-        base = re.split(r"[_-]", fname, 1)[0].strip()
+        stem = os.path.splitext(fname)[0]
+
+        # Foretræk " - " som separator mellem prefix og resten
+        if " - " in stem:
+            base = stem.split(" - ", 1)[0].strip()
+        else:
+            # Fallback: første "_" eller "-"
+            parts = re.split(r"[_-]", stem, 1)
+            base = parts[0].strip() if parts else stem.strip()
+
         if not base:
             continue
+
         std_name = base.replace("_", " ").strip().title()
         groups[base]["name"] = std_name
 
         lf = fname.lower()
-        if lf.endswith(".csv") or lf.endswith(".xlsx"):
+        if lf.endswith((".csv", ".xlsx")):
             groups[base]["csv"] = f
         elif "floorplan" in lf or "linedrawing" in lf:
             groups[base]["floorplan"] = f
@@ -487,19 +496,21 @@ def group_uploaded_files(uploaded_files: List[io.BytesIO]) -> Dict[str, Dict[str
             st.warning(f"Ignorerer '{data.get('name', base)}': mangler CSV/XLSX eller rendering.")
     return out
 
-
-# ---------------------------------
-# STREAMLIT UI
-# ---------------------------------
+# ==============================
+# Streamlit UI
+# ==============================
 
 def main():
     st.set_page_config(page_title="Muuto PowerPoint Generator", layout="wide")
     st.title("Muuto PowerPoint Generator")
-    st.caption("Kombinerer EY-packshotlogik (masterdata) og pCon-produktliste i én PPT ud fra input-template.pptx")
+    st.caption("Kombinerer pCon CSV, renderinger og Master-data packshots i input-template.pptx")
 
-    st.subheader("1) Upload alle setting-filer på én gang")
-    st.write("CSV/XLSX fra pCon, rendering JPG/PNG, valgfri floorplan/linedrawing JPG/PNG. Filer med samme prefix grupperes.")
-    uploads = st.file_uploader("Filer", type=["csv", "xlsx", "jpg", "jpeg", "png"], accept_multiple_files=True)
+    st.subheader("1) Upload alle setting-filer samtidigt")
+    uploads = st.file_uploader(
+        "CSV/XLSX + JPG/PNG + valgfri floorplan",
+        type=["csv", "xlsx", "jpg", "jpeg", "png"],
+        accept_multiple_files=True
+    )
 
     st.subheader("2) Manuelle felter (gælder for alle settings)")
     c1, c2, c3 = st.columns(3)
@@ -511,21 +522,20 @@ def main():
         size = st.text_input("SettingSize", value="")
 
     st.subheader("3) Generér PowerPoint")
-
-    if st.button("Generér"):
-        errors = []
+    if st.button("Generér", type="primary"):
+        errs = []
         if not os.path.exists(TEMPLATE_FILENAME):
-            errors.append(f"Skabelonen '{TEMPLATE_FILENAME}' blev ikke fundet i mappen.")
+            errs.append(f"Skabelonen '{TEMPLATE_FILENAME}' findes ikke i mappen.")
         if not uploads:
-            errors.append("Ingen filer uploadet.")
-        if errors:
-            for e in errors:
+            errs.append("Ingen filer uploadet.")
+        if errs:
+            for e in errs:
                 st.error(e)
             st.stop()
 
         grouped = group_uploaded_files(uploads)
         if not grouped:
-            st.error("Ingen gyldige settings. Tjek filnavne og upload mindst CSV + rendering pr. setting.")
+            st.error("Ingen gyldige settings fundet. Tjek filnavne og upload mindst CSV + rendering.")
             st.stop()
 
         settings = []
@@ -545,14 +555,13 @@ def main():
             })
 
         with st.spinner("Indlæser opslagsdata og skabelon…"):
-            # Synonymer for robust kolonnematch
             library_required = {
                 "PRODUCT": ["Product", "Product Name", "PRODUCTNAME", "Name"],
                 "EUR ITEM NO.": ["EUR ITEM NO", "EUR_ITEM_NO", "Item No. EUR", "EUR Item Number"]
             }
             master_required = {
                 "ITEM NO.": ["ITEM NO", "ITEM_NO", "Item Number", "SKU", "ITEM"],
-                "IMAGE URL": ["IMAGEURL", "Packshot URL", "PackshotURL", "Image", "Image Link", "Picture URL"]
+                "IMAGE URL": ["Image URL", "Image Link", "Picture URL", "Packshot URL", "ImageURL", "Image"]
             }
 
             library_df = load_lookup_table(LIBRARY_DEFAULT_URL, library_required, "Library_data")
@@ -570,7 +579,7 @@ def main():
         buf = io.BytesIO()
         prs.save(buf)
         buf.seek(0)
-        st.success("PowerPoint klar.")
+        st.success("PowerPoint genereret.")
         st.download_button(
             "Download præsentation",
             data=buf,
