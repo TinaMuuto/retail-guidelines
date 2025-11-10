@@ -4,3 +4,4 @@ openpyxl
 python-pptx
 Pillow
 numpy
+requests
