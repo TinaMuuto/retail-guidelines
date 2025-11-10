@@ -47,7 +47,7 @@ def load_master(master_url: str) -> pd.DataFrame:
             if norm(a) in norm_map: return norm_map[norm(a)]
         return None
     col_item = mapcol("ITEM NO.", ["Item No.","ITEM","SKU","Item Number","ItemNo","ITEM_NO"])
-    col_img  = mapcol("IMAGE URL", ["Image URL","Image Link","Picture URL","Packshot URL","ImageURL","Image"])
+    col_img  = mapcol("IMAGE URL", [     "Image URL", "Image Link", "Picture URL", "Packshot URL",     "ImageURL", "Image", "IMAGE DOWNLOAD LINK" ])
     missing = [n for n,v in {"ITEM NO.":col_item,"IMAGE URL":col_img}.items() if v is None]
     if missing:
         st.error(f"Master mangler kolonner: {', '.join(missing)}"); st.stop()
