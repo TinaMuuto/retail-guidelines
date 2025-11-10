@@ -18,7 +18,7 @@ IDX_SHORT, IDX_VARIANT, IDX_ARTICLE, IDX_QTY = 2, 4, 17, 30
 
 # Template tags
 TAG_SETTINGNAME = "{{SETTINGNAME}}"
-TAG_PRODUCTS_LIST = "{{ProductsinSettingList}}"
+TAG_PRODUCTS_LIST = "{{ProductsinSettingList}}" 
 TAG_RENDERING = "{{Rendering}}"
 TAG_LINEDRAWING = "{{Linedrawing}}"
 OVERVIEW_TITLE = "OVERVIEW"
@@ -51,12 +51,29 @@ def _norm_tag(tag: str) -> str:
     return _norm_placeholder_text(tag)
 
 def find_shape_by_placeholder(slide, tag: str):
+    """
+    Tries to find a shape/placeholder by its text content (tag). 
+    Aggressively checks all shapes for matching text, as image placeholders may not be standard TextFrames.
+    """
     want = _norm_tag(tag)
+    
+    # Check all shapes in the slide
     for shp in slide.shapes:
         if getattr(shp, "has_text_frame", False) and shp.text_frame:
             txt = shp.text_frame.text or ""
             if want in _norm_placeholder_text(txt):
                 return shp
+        
+        # Also check placeholder text for non-text shapes (like Pictures/Charts)
+        if getattr(shp, 'placeholder_format', None) and shp.placeholder_format.type:
+            try:
+                # Check if placeholder name matches
+                if _norm_tag(shp.name) == want:
+                    return shp
+            except AttributeError:
+                pass # Ignore if shape name doesn't exist
+                
+    # Check all placeholders (often the easiest route if they are standard)
     for shp in getattr(slide, "placeholders", []):
         if getattr(shp, "has_text_frame", False) and shp.text_frame:
             txt = shp.text_frame.text or ""
@@ -156,7 +173,7 @@ def duplicate_slide(prs: Presentation, slide):
         sp = shp.element
         sp.getparent().remove(sp)
     for shp in slide.shapes:
-        new_slide.shapes._spTree.append(deepcopy(shape._element))
+        new_slide.shapes._spTree.append(deepcopy(shp._element))
     return new_slide
 
 def remove_slide(prs: Presentation, index: int):
@@ -176,6 +193,12 @@ def find_first_slide_with_tag(prs: Presentation, tag: str) -> Tuple[Any, int]:
                 if want in _norm_placeholder_text(shp.text_frame.text):
                     return sl, i
     return None, -1
+
+def blank_layout(prs: Presentation):
+    for ly in prs.slide_layouts:
+        if ly.name and "blank" in ly.name.lower():
+            return ly
+    return prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[1]
 
 
 # ----------------------------------------------------------------------
@@ -318,30 +341,40 @@ def preprocess(img: bytes, max_side=1400, quality=85) -> bytes:
             im = im.resize((int(im.width*ratio), int(im.height*ratio)), Image.Resampling.LANCZOS)
             
         buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=quality, optimize=True) 
+        im.save(buf, format="JPEG", quality=85, optimize=True) 
         buf.seek(0)
         return buf.getvalue()
     except Exception:
         return img 
 
 # --------- PPT-byggesten ---------
-def create_product_list_text(items: List[Dict[str, Any]]) -> str:
-    """Generates a multiline string of product lists in the required format."""
-    lines = []
-    for it in items:
-        article = str(it["article_no"])
-        desc = str(it["desc_text"])
-        qty = str(int(it["qty"])) 
-        newno = str(it.get("new_item_no", ""))
-        
-        id_combo = article
-        if newno and newno != "NAN":
-            id_combo = f'{article} / {newno}'
-        
-        line = f'{qty} X {desc} - {id_combo}'
-        lines.append(line)
-        
-    return "\n".join(lines)
+
+def add_products_table_on_blank(prs: Presentation, title: str, rows: List[List[str]]):
+    """Adds a new slide with product list as an unformatted table."""
+    s = prs.slides.add_slide(blank_layout(prs)) 
+    
+    # Title textbox
+    left, top, width, height = Inches(0.6), Inches(0.3), Inches(9.2), Inches(0.6)
+    tx_shape = s.shapes.add_textbox(left, top, width, height)
+    set_text_preserve_style(tx_shape, title.upper()) 
+
+    headers = ["Quantity", "Description", "Article No. / New Item No."]
+    data = [headers] + rows
+    left, top, width, height = Inches(0.6), Inches(1.2), Inches(9.2), Inches(5.5)
+    
+    # Adds table with default/unformatted style
+    tbl_shape = s.shapes.add_table(rows=len(data), cols=3, left=left, top=top, width=width, height=height)
+    tbl = tbl_shape.table
+    
+    # Populate table cells and set font size (retains template's default font)
+    for r_i, row in enumerate(data):
+        for c_i, val in enumerate(row):
+            cell = tbl.cell(r_i, c_i)
+            cell.text = str(val).upper() 
+            # Apply font size to retain style consistency across the app
+            for p in cell.text_frame.paragraphs:
+                for run in p.runs: run.font.size = Pt(12)
+    return s
 
 
 def build_presentation(master_df: pd.DataFrame,
@@ -402,12 +435,13 @@ def build_presentation(master_df: pd.DataFrame,
             if desc_tag_shape:
                 set_text_preserve_style(desc_tag_shape, it.get("desc_text",""))
 
-        # C. Product Overview list in {{ProductsinSettingList}}
-        product_list_text = create_product_list_text(g["items"])
-        list_shape = find_shape_by_placeholder(s, TAG_PRODUCTS_LIST)
-        
-        if list_shape:
-            set_text_preserve_style(list_shape, product_list_text)
+        # C. Product Overview: Add a separate slide with a table
+        rows = []
+        for it in g["items"]:
+            id_combo = it["article_no"]
+            if it.get("new_item_no"): id_combo = f'{it["article_no"]} / {it["new_item_no"]}'
+            rows.append([it["qty"], it["desc_text"], id_combo])
+        add_products_table_on_blank(prs, f"PRODUCTS – {g['name']}", rows)
 
     # 4. REMOVE ORIGINAL TEMPLATE SLIDES
     indices_to_remove = []
@@ -430,7 +464,7 @@ def main():
     st.set_page_config(page_title="Muuto PPT Generator", layout="wide")
     st.title("Muuto PPT Generator")
     
-    # NEW: Application Description
+    # Application Description
     st.markdown(
         """
         This tool automatically generates a **Shop the Look** PowerPoint presentation
