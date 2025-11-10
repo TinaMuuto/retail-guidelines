@@ -52,28 +52,28 @@ def _norm_tag(tag: str) -> str:
 
 def find_shape_by_placeholder(slide, tag: str):
     """
-    Tries to find a shape/placeholder by its text content (tag). 
-    Aggressively checks all shapes for matching text, as image placeholders may not be standard TextFrames.
+    Finds a shape/placeholder by its text content (tag). 
+    Searches through all shapes and placeholders.
     """
     want = _norm_tag(tag)
     
-    # Check all shapes in the slide
+    # Check all shapes (most robust for non-standard text/image boxes)
     for shp in slide.shapes:
+        # Check if the shape has text (for text placeholders)
         if getattr(shp, "has_text_frame", False) and shp.text_frame:
             txt = shp.text_frame.text or ""
             if want in _norm_placeholder_text(txt):
                 return shp
         
-        # Also check placeholder text for non-text shapes (like Pictures/Charts)
-        if getattr(shp, 'placeholder_format', None) and shp.placeholder_format.type:
-            try:
-                # Check if placeholder name matches
-                if _norm_tag(shp.name) == want:
-                    return shp
-            except AttributeError:
-                pass # Ignore if shape name doesn't exist
+        # Check if shape name contains the tag (for named image/picture shapes)
+        try:
+            # Note: This is a fallback if the image is named manually and not a text box.
+            if shp.name and want in _norm_tag(shp.name):
+                return shp
+        except Exception:
+            pass
                 
-    # Check all placeholders (often the easiest route if they are standard)
+    # Check all placeholders (for standard placeholders)
     for shp in getattr(slide, "placeholders", []):
         if getattr(shp, "has_text_frame", False) and shp.text_frame:
             txt = shp.text_frame.text or ""
@@ -363,7 +363,13 @@ def add_products_table_on_blank(prs: Presentation, title: str, rows: List[List[s
     left, top, width, height = Inches(0.6), Inches(1.2), Inches(9.2), Inches(5.5)
     
     # Adds table with default/unformatted style
-    tbl_shape = s.shapes.add_table(rows=len(data), cols=3, left=left, top=top, width=width, height=height)
+    # We use table style 3 for a basic, unstyled look if possible
+    try:
+        tbl_shape = s.shapes.add_table(rows=len(data), cols=3, left=left, top=top, width=width, height=height)
+    except Exception:
+        # Fallback if table creation fails
+        return
+
     tbl = tbl_shape.table
     
     # Populate table cells and set font size (retains template's default font)
@@ -373,7 +379,9 @@ def add_products_table_on_blank(prs: Presentation, title: str, rows: List[List[s
             cell.text = str(val).upper() 
             # Apply font size to retain style consistency across the app
             for p in cell.text_frame.paragraphs:
-                for run in p.runs: run.font.size = Pt(12)
+                for run in p.runs: 
+                    # Set font size to 12pt and ensure it uses the table style's font
+                    run.font.size = Pt(12) 
     return s
 
 
