@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 from pptx import Presentation
 from pptx.util import Inches, Pt
-from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
+from pptx.enum.shapes import PP_PLACEHOLDER
 from PIL import Image
 import io, os, re, requests, csv
 from typing import List, Dict, Any, Tuple
@@ -27,6 +27,9 @@ OVERVIEW_TITLE = "OVERVIEW"
 PACKSHOT_TAGS = [f"{{{{ProductPackshot{i}}}}}" for i in range(1, 13)]
 PROD_DESC_TAGS = [f"{{{{PRODUCT DESCRIPTION {i}}}}}" for i in range(1, 13)]
 OVERVIEW_TAGS = [f"{{{{Rendering{i}}}}}" for i in range(1, 13)]
+
+# GLOBAL TIMEOUT FOR REQUESTS
+REQUEST_TIMEOUT = 60 # Increased from 20 to 60 seconds to avoid ReadTimeout error
 
 # ----------------------------------------------------------------------
 # --------- Utils ------------------------------------------------------
@@ -54,25 +57,22 @@ def _norm_tag(tag: str) -> str:
 def find_shape_by_placeholder(slide, tag: str, find_placeholder_type=False):
     """
     Finds a shape/placeholder by its text content (tag). 
-    If find_placeholder_type is True, it returns the shape only if it's a true placeholder.
+    If find_placeholder_type is True, it prioritizes returning only true placeholders.
     """
     want = _norm_tag(tag)
     
-    # 1. Check true placeholders first (essential for images/layout fields)
+    # 1. Check true placeholders first (necessary for picture insertion)
     for ph in getattr(slide, "placeholders", []):
         try:
-            if ph.text and want in _norm_placeholder_text(ph.text):
-                return ph
-            # Fallback: check placeholder name/element id if text is missing
-            if want in _norm_tag(getattr(ph, 'name', '')):
+            if ph.has_text_frame and ph.text and want in _norm_placeholder_text(ph.text):
                 return ph
         except AttributeError:
             continue
             
     if find_placeholder_type:
-        return None # Return None if only placeholders were requested and not found
+        return None 
 
-    # 2. Check all other shapes (robust for non-standard text boxes)
+    # 2. Check all other shapes (robust for non-standard text boxes and named shapes)
     for shp in slide.shapes:
         if getattr(shp, "has_text_frame", False) and shp.text_frame:
             txt = shp.text_frame.text or ""
@@ -132,30 +132,26 @@ def set_text_preserve_style(shape, text: str):
 def replace_image_by_tag(slide, tag: str, img_bytes: bytes):
     if not img_bytes: return
     
-    # Prøv at finde som ægte Picture Placeholder (mest stabil)
+    img_stream = io.BytesIO(img_bytes)
+    
+    # 1. Try inserting into a true placeholder (stable method)
     ph = find_shape_by_placeholder(slide, tag, find_placeholder_type=True) 
     
-    # Hvis en ægte placeholder findes, og den kan acceptere billeder:
-    if ph and getattr(ph.placeholder_format, 'type', None) in [PP_PLACEHOLDER.PICTURE, PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT]:
+    if ph:
         try:
-            # Brug den indbyggede metode, som respekterer Master Slide-formatering
-            img_stream = io.BytesIO(img_bytes)
-            ph.insert_picture(img_stream)
-            img_stream.seek(0)
-            return
+            if getattr(ph.placeholder_format, 'type', None) in [PP_PLACEHOLDER.PICTURE, PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT]:
+                ph.insert_picture(img_stream)
+                img_stream.seek(0)
+                return
         except Exception:
-            # Hvis insert_picture fejler, falder vi tilbage til den aggressive erstatning
-            pass
+            pass # Fallback to aggressive replacement
     
-    # Hvis det IKKE var en ægte placeholder (eller insert_picture fejlede), 
-    # falder vi tilbage til at finde det som en almindelig shape og erstatte aggressivt:
+    # 2. Aggressive delete-and-reinsert method (fallback)
     
     ph = find_shape_by_placeholder(slide, tag)
     if not ph: return
     
     left, top, w, h = ph.left, ph.top, ph.width, ph.height
-    
-    img_stream = io.BytesIO(img_bytes)
     
     try:
         im = Image.open(img_stream)
@@ -215,14 +211,14 @@ def blank_layout(prs: Presentation):
     for ly in prs.slide_layouts:
         if ly.name and "blank" in ly.name.lower():
             return ly
-    return prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[1]
+    return prs.slide_layouts[6] if len(prs.slides) > 6 else prs.slide_layouts[1]
 
 # --- Template Creator (For UI Download) ---
 def create_simple_template_pptx() -> bytes:
     """Creates a simple, functional PowerPoint template with all required placeholders."""
     prs = Presentation()
     
-    blank_layout = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[1]
+    blank_layout = prs.slide_layouts[6] if len(prs.slides) > 6 else prs.slide_layouts[1]
     
     # --- OVERVIEW Slide ---
     s_overview = prs.slides.add_slide(blank_layout)
@@ -268,13 +264,14 @@ def create_simple_template_pptx() -> bytes:
 
 
 # ----------------------------------------------------------------------
-# --------- Data-loaders & Lookups (Unchanged) -------------------------
+# --------- Data-loaders & Lookups -------------------------------------
 # ----------------------------------------------------------------------
 
 @st.cache_data
 def load_master() -> pd.DataFrame:
     url = resolve_gsheet_to_csv(MASTER_URL)
-    r = requests.get(url, timeout=20); r.raise_for_status()
+    # BRUGER OPPDATERT GLOBAL TIMEOUT
+    r = requests.get(url, timeout=REQUEST_TIMEOUT); r.raise_for_status()
     df = pd.read_csv(io.BytesIO(r.content))
     def norm(s): return re.sub(r"[\s_.-]+","",str(s).strip().lower())
     norm_map = {norm(c): c for c in df.columns}
@@ -293,7 +290,8 @@ def load_master() -> pd.DataFrame:
 @st.cache_data
 def load_mapping() -> pd.DataFrame:
     url = resolve_gsheet_to_csv(MAPPING_URL)
-    r = requests.get(url, timeout=20); r.raise_for_status()
+    # BRUGER OPPDATERT GLOBAL TIMEOUT
+    r = requests.get(url, timeout=REQUEST_TIMEOUT); r.raise_for_status()
     df = pd.read_csv(io.BytesIO(r.content))
     def norm(s): return re.sub(r"[\s_.-]+","",str(s).strip().lower())
     norm_map = {norm(c): c for c in df.columns}
@@ -380,12 +378,12 @@ def mapping_description(map_df: pd.DataFrame, article: str) -> str:
     hit = map_df.loc[map_df["OLD Item-variant"].apply(fallback_key) == base, "Description"]
     return str(hit.iloc[0]) if not hit.empty else ""
 
-# --------- Image Utilities (Unchanged) ---------
+# --------- Image Utilities ---------
 @st.cache_data(ttl=3600)
 def fetch_image(url: str) -> bytes | None:
     if not url or not url.startswith("http"): return None
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         
         content_type = r.headers.get("Content-Type","").lower()
@@ -413,7 +411,7 @@ def preprocess(img: bytes, max_side=1400, quality=85) -> bytes:
     except Exception:
         return img 
 
-# --------- PPT-byggesten (Opdateret) ---------
+# --------- PPT-byggesten CORE ---------
 
 def add_products_table_on_blank(prs: Presentation, title: str, rows: List[List[str]]):
     """Adds a new slide with product list as an unformatted table."""
@@ -428,7 +426,6 @@ def add_products_table_on_blank(prs: Presentation, title: str, rows: List[List[s
     data = [headers] + rows
     left, top, width, height = Inches(0.6), Inches(1.2), Inches(9.2), Inches(5.5)
     
-    # Adds table with default/unformatted style
     try:
         tbl_shape = s.shapes.add_table(rows=len(data), cols=3, left=left, top=top, width=width, height=height)
     except Exception:
@@ -436,12 +433,10 @@ def add_products_table_on_blank(prs: Presentation, title: str, rows: List[List[s
 
     tbl = tbl_shape.table
     
-    # Populate table cells and set font size (retains template's default font)
     for r_i, row in enumerate(data):
         for c_i, val in enumerate(row):
             cell = tbl.cell(r_i, c_i)
             cell.text = str(val).upper() 
-            # Apply font size to retain style consistency across the app
             for p in cell.text_frame.paragraphs:
                 for run in p.runs: 
                     run.font.size = Pt(12) 
@@ -465,7 +460,6 @@ def build_presentation(master_df: pd.DataFrame,
             for i, rb in enumerate(overview_renderings[:12]):
                 replace_image_by_tag(s, OVERVIEW_TAGS[i], preprocess(rb))
         else:
-            # Fallback to blank slide
             s = prs.slides.add_slide(blank_layout(prs))
             tx = s.shapes.add_textbox(Inches(0.6), Inches(0.3), Inches(9), Inches(0.6))
             set_text_preserve_style(tx, OVERVIEW_TITLE)
@@ -532,10 +526,12 @@ def build_presentation(master_df: pd.DataFrame,
 
 # --------- UI ---------
 def main():
+    if 'groups_map_state' not in st.session_state:
+        st.session_state.groups_map_state = {}
+
     st.set_page_config(page_title="Muuto PPT Generator", layout="wide")
     st.title("Muuto PPT Generator")
     
-    # Application Description
     st.markdown(
         """
         This tool automatically generates a **Shop the Look** PowerPoint presentation
@@ -554,14 +550,14 @@ def main():
         st.success(f"Template file '{TEMPLATE_FILE}' found. Proceed to file upload.")
         
     if st.button("Download Template File (input-template.pptx)"):
-        with st.spinner("Generating simple template..."):
-            template_bytes = create_simple_template_pptx()
-            st.download_button(
-                "Click to Download Template",
-                data=template_bytes,
-                file_name=TEMPLATE_FILE,
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
-            )
+        # We don't need to put this in spinner as it runs outside the main execution block
+        template_bytes = create_simple_template_pptx()
+        st.download_button(
+            "Click to Download Template",
+            data=template_bytes,
+            file_name=TEMPLATE_FILE,
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        )
     st.markdown("---")
     # --- End Template Download Section ---
 
@@ -571,46 +567,130 @@ def main():
         type=["csv","jpg","jpeg","png"],
         accept_multiple_files=True
     )
+    
+    # ----------------------------------------------------------------------
+    # 1. Automatic Grouping (Initial Guess) and State Management
+    # ----------------------------------------------------------------------
+    
+    uploaded_files_data = []
+    if uploads:
+        st.subheader("File Grouping Overview (Manual Adjustment)")
+        st.markdown("If the **Grouping Key** is wrong, please correct it to match the key of the corresponding files (e.g., 'Shop-the-look_2025_Q2 - dining 01').")
+        
+        # Determine unique IDs of files currently in the uploader
+        current_file_ids = {f.file_id: f for f in uploads}
+
+        # Clear state for files that are no longer uploaded
+        keys_to_delete = [fid for fid in st.session_state.groups_map_state if fid not in current_file_ids]
+        for fid in keys_to_delete:
+            del st.session_state.groups_map_state[fid]
+
+        # Process newly uploaded files
+        for f in uploads:
+            file_id = f.file_id
+            name, _ = os.path.splitext(f.name)
+            
+            # Logic to generate initial grouping key
+            base_name = name
+            lf = f.name.lower()
+            is_line_drawing = any(k in lf for k in ["line","floorplan","drawing"])
+            if is_line_drawing:
+                base_name = re.sub(r"[\s_-]*(line|floorplan|drawing)$", "", base_name, flags=re.I).strip()
+            base_key = base_name.strip()
+            
+            # Initialize or update state
+            if file_id not in st.session_state.groups_map_state:
+                 st.session_state.groups_map_state[file_id] = {"filename": f.name, "current_group_key": base_key}
+            
+            # Gather files for display/processing (using current state key)
+            uploaded_files_data.append({
+                "file_id": file_id,
+                "filename": f.name,
+                "current_group_key": st.session_state.groups_map_state[file_id]["current_group_key"],
+                "file_object": f
+            })
+            
+        
+        # Display table headers
+        col1, col2, col3 = st.columns([1, 2, 4])
+        col1.markdown("**ID**")
+        col2.markdown("**File Name**")
+        col3.markdown("**Grouping Key (Editable)**")
+        
+        # Display interactive rows
+        keys_changed = False
+        for i, item in enumerate(uploaded_files_data):
+            file_id = item['file_id']
+            file_type = item['filename'].split('.')[-1].upper()
+            
+            # Use columns again to align text input
+            col_id, col_name, col_input = st.columns([1, 2, 4])
+            
+            col_id.write(f"`...{file_id[-4:]}`") 
+            col_name.write(f"**`{file_type}`**: {item['filename']}")
+            
+            # Text Input for manual correction
+            new_key = col_input.text_input(
+                label="Grouping Key",
+                value=st.session_state.groups_map_state[file_id]["current_group_key"],
+                key=f"group_key_{file_id}",
+                label_visibility="collapsed"
+            )
+            
+            # Update session state if key was changed
+            if new_key != st.session_state.groups_map_state[file_id]["current_group_key"]:
+                 st.session_state.groups_map_state[file_id]["current_group_key"] = new_key
+                 keys_changed = True
+        
+        # If keys changed during input, rerun to ensure logic is based on final state before execution
+        if keys_changed:
+             st.experimental_rerun()
+    
+    st.markdown("---")
 
     if st.button("Generate PPT", type="primary"):
         if not os.path.exists(TEMPLATE_FILE):
             st.error(f"Template file '{TEMPLATE_FILE}' is missing. Please use the download button above to generate it."); st.stop()
+        
+        if not uploaded_files_data:
+             st.error("Please upload files first."); st.stop()
+
 
         # USER-FRIENDLY SINGLE SPINNER
         with st.spinner("Processing files and generating presentation... This may take a moment."):
             try:
                 # 1. Load data
+                # Increased timeout handles the ReadTimeout error for Google Sheets
                 master_df  = load_master()
                 mapping_df = load_mapping()
     
-                # 2. Group files
-                groups_map: Dict[str, Dict[str, Any]] = {}
-                for f in uploads or []:
-                    name, ext = os.path.splitext(f.name)
+                # 2. Final Grouping based on Session State
+                final_groups_map: Dict[str, Dict[str, Any]] = {}
+                
+                for item in uploaded_files_data:
+                    current_key = item['current_group_key']
+                    f = item['file_object']
+                    
+                    if current_key not in final_groups_map:
+                         # Use the key to derive the user-friendly setting name
+                         setting_name = current_key.split(" - ", 1)[-1].title().strip()
+                         if setting_name == current_key: setting_name = current_key.title()
+                         final_groups_map[current_key] = {"name": setting_name, "csv": None, "rendering": None, "line": None}
+                         
                     lf = f.name.lower()
                     
-                    base_name = name
-                    is_line_drawing = any(k in lf for k in ["line","floorplan","drawing"])
-                    if is_line_drawing:
-                        base_name = re.sub(r"[\s_-]*(line|floorplan|drawing)$", "", base_name, flags=re.I).strip()
-                    
-                    base_key = base_name.strip()
-                    parts = base_key.split(" - ", 1)
-                    setting_title = parts[-1].title().strip() if len(parts) > 1 else base_key.title()
-                    
-                    groups_map.setdefault(base_key, {"name": setting_title, "csv": None, "rendering": None, "line": None})
-                    
-                    if ext.lower() == ".csv":
-                        groups_map[base_key]["csv"] = f
-                    elif is_line_drawing:
-                        groups_map[base_key]["line"] = f
+                    # Prioritize file types based on suffix
+                    if lf.endswith(".csv"):
+                        final_groups_map[current_key]["csv"] = f
+                    elif any(k in lf for k in ["line","floorplan","drawing"]):
+                        final_groups_map[current_key]["line"] = f
                     elif lf.endswith((".jpg",".jpeg",".png")):
-                        groups_map[base_key]["rendering"] = f
+                        final_groups_map[current_key]["rendering"] = f
                 
                 settings, overview_imgs = [], []
-                for base, data in groups_map.items():
+                for key, data in final_groups_map.items():
                     if not data["csv"] or not data["rendering"]:
-                        st.warning(f"⚠️ Skipping '{data['name']}' – requires both CSV and Rendering.")
+                        st.warning(f"⚠️ Skipping setting '{data['name']}' – requires both CSV and Rendering.")
                         continue
     
                     # 3. Read CSV and prepare items
@@ -655,9 +735,10 @@ def main():
                     mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
                 )
             except Exception as e:
-                # Catch specific data errors vs unexpected errors
                 error_message = str(e)
-                if "Master is missing columns" in error_message or "Mapping is missing columns" in error_message:
+                if "Read timed out" in error_message or "HTTPSConnectionPool" in error_message:
+                     st.error("❌ Network Timeout Error: Could not connect to Google Sheets. Please ensure the links are correct and try again.")
+                elif "Master is missing columns" in error_message or "Mapping is missing columns" in error_message:
                      st.error(f"❌ Data Error: {error_message}")
                 elif "Template file" in error_message:
                      st.error(f"❌ Template Error: {error_message}. Please use the 'Download Template File' button to fix.")
