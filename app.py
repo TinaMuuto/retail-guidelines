@@ -1,101 +1,159 @@
+# app.py
 import streamlit as st
 import pandas as pd
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from PIL import Image
-import io, os, re, requests
+import io, os, re, requests, csv
 from typing import List, Dict, Any
 
-# ---------------- Const ----------------
+# ---------------- Konstanter ----------------
 TEMPLATE_FILE = "input-template.pptx"
 
-# pCon CSV: faste kolonneindekser og skip
+# Faste Google Sheets (må IKKE vises i UI)
+MASTER_URL  = "https://docs.google.com/spreadsheets/d/1blj42SbFpszWGyOrDOUwyPDJr9K1NGpTMX6eZTbt_P4/edit?gid=1152340088#gid=1152340088"
+MAPPING_URL = "https://docs.google.com/spreadsheets/d/1S50it_q1BahpZCPW8dbuN7DyOMnyDgFIg76xIDSoXEk/edit?gid=1056617222#gid=1056617222"
+
+# pCon CSV kolonneindeks og skip
 PCON_SKIPROWS = 2
 IDX_SHORT, IDX_VARIANT, IDX_ARTICLE, IDX_QTY = 2, 4, 17, 30
 
-# Template placeholders vi understøtter
+# Template placeholders
 PACKSHOT_PLACEHOLDERS = [f"{{{{ProductPackshot{i}}}}}" for i in range(1, 13)]
 RENDERING_TAG = "{{Rendering}}"
 LINEDRAWING_TAG = "{{Linedrawing}}"
 
-# Master kolonnenavne efter mapping
-MASTER_PACKSHOT_CANON = "IMAGE URL"
-
-# ---------------- URL helpers ----------------
+# ---------------- URL helper ----------------
 def resolve_gsheet_to_csv(url: str) -> str:
-    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-        return url
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
-    if not m:
-        return url
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url or "")
+    if not m: return url
     sheet = m.group(1)
-    gidm = re.search(r"[#?&]gid=(\d+)", url)
-    gid = gidm.group(1) if gidm else "0"
+    gid_m = re.search(r"[#?&]gid=(\d+)", url)
+    gid = gid_m.group(1) if gid_m else "0"
     return f"https://docs.google.com/spreadsheets/d/{sheet}/export?format=csv&gid={gid}"
 
 # ---------------- Loaders ----------------
 @st.cache_data
-def load_master(master_url: str) -> pd.DataFrame:
-    url = resolve_gsheet_to_csv(master_url) if master_url.startswith("http") else master_url
+def load_master() -> pd.DataFrame:
+    """
+    Returnerer to kolonner:
+     - ITEM NO.
+     - IMAGE URL  (accepterer synonym: IMAGE DOWNLOAD LINK)
+    """
+    url = resolve_gsheet_to_csv(MASTER_URL)
     r = requests.get(url, timeout=20); r.raise_for_status()
     df = pd.read_csv(io.BytesIO(r.content))
-    # kolonne-synonymer
+
     def norm(s): return re.sub(r"[\s_.-]+","",str(s).strip().lower())
     norm_map = {norm(c): c for c in df.columns}
+
     def mapcol(canon, alts):
-        for a in [canon]+alts:
-            if norm(a) in norm_map: return norm_map[norm(a)]
+        for a in [canon] + alts:
+            if norm(a) in norm_map:
+                return norm_map[norm(a)]
         return None
+
     col_item = mapcol("ITEM NO.", ["Item No.","ITEM","SKU","Item Number","ItemNo","ITEM_NO"])
-    col_img  = mapcol("IMAGE URL", [     "Image URL", "Image Link", "Picture URL", "Packshot URL",     "ImageURL", "Image", "IMAGE DOWNLOAD LINK" ])
+    col_img  = mapcol("IMAGE URL", [
+        "Image URL","Image Link","Picture URL","Packshot URL","ImageURL","Image","IMAGE DOWNLOAD LINK"
+    ])
     missing = [n for n,v in {"ITEM NO.":col_item,"IMAGE URL":col_img}.items() if v is None]
     if missing:
         st.error(f"Master mangler kolonner: {', '.join(missing)}"); st.stop()
+
     df = df.rename(columns={col_item:"ITEM NO.", col_img:"IMAGE URL"})
     df["ITEM NO."] = df["ITEM NO."].astype(str).str.strip()
+    df["IMAGE URL"] = df["IMAGE URL"].astype(str).str.strip()
     return df[["ITEM NO.","IMAGE URL"]]
 
 @st.cache_data
-def load_mapping(mapping_url: str) -> pd.DataFrame:
-    """Mapping: OLD Item-variant -> New Item No."""
-    url = resolve_gsheet_to_csv(mapping_url) if mapping_url.startswith("http") else mapping_url
+def load_mapping() -> pd.DataFrame:
+    """
+    Mapping: OLD Item-variant -> New Item No.
+    Bruges til at vise: Article No. / New Item No.
+    """
+    url = resolve_gsheet_to_csv(MAPPING_URL)
     r = requests.get(url, timeout=20); r.raise_for_status()
     df = pd.read_csv(io.BytesIO(r.content))
+
     def norm(s): return re.sub(r"[\s_.-]+","",str(s).strip().lower())
     norm_map = {norm(c): c for c in df.columns}
+
     def mapcol(canon, alts):
         for a in [canon]+alts:
-            if norm(a) in norm_map: return norm_map[norm(a)]
+            if norm(a) in norm_map:
+                return norm_map[norm(a)]
         return None
-    col_old = mapcol("OLD Item-variant", ["OLD Item variant","OLD_ITEM_VARIANT","Old Item","Old SKU"])
-    col_new = mapcol("New Item No.", ["New Item Number","NEW_ITEM_NO","New SKU"])
+
+    col_old = mapcol("OLD Item-variant", ["OLD Item variant","OLD_ITEM_VARIANT","Old Item","Old SKU","OLD ITEM NO."])
+    col_new = mapcol("New Item No.",   ["New Item Number","NEW_ITEM_NO","New SKU","NEW ITEM NO."])
     missing = [n for n,v in {"OLD Item-variant":col_old,"New Item No.":col_new}.items() if v is None]
     if missing:
         st.error(f"Mapping mangler kolonner: {', '.join(missing)}"); st.stop()
+
     df = df.rename(columns={col_old:"OLD Item-variant", col_new:"New Item No."})
     df["OLD Item-variant"] = df["OLD Item-variant"].astype(str).str.strip()
-    df["New Item No."] = df["New Item No."].astype(str).str.strip()
+    df["New Item No."]     = df["New Item No."].astype(str).str.strip()
     return df[["OLD Item-variant","New Item No."]]
 
-# ---------------- pCon CSV ----------------
-def pcon_from_csv(f) -> pd.DataFrame:
-    df = pd.read_csv(f, skiprows=PCON_SKIPROWS, header=None)
-    need = max(IDX_SHORT, IDX_VARIANT, IDX_ARTICLE, IDX_QTY)
-    if df.shape[1] <= need:
-        st.error("pCon CSV har for få kolonner."); st.stop()
-    out = df.iloc[:, [IDX_SHORT, IDX_VARIANT, IDX_ARTICLE, IDX_QTY]].copy()
-    out.columns = ["SHORT_TEXT","VARIANT_TEXT","ARTICLE_NO","QUANTITY"]
-    out["ARTICLE_NO"] = out["ARTICLE_NO"].astype(str).str.strip()
-    out["SHORT_TEXT"] = out["SHORT_TEXT"].astype(str).str.strip()
-    out["VARIANT_TEXT"] = out["VARIANT_TEXT"].astype(str).str.strip()
-    out["QUANTITY"] = pd.to_numeric(out["QUANTITY"], errors="coerce").fillna(1).astype(int)
-    return out[out["ARTICLE_NO"].ne("")]
+# ---------------- pCon CSV robust parser ----------------
+def _try_read_csv(fileobj, **kwargs):
+    fileobj.seek(0)
+    return pd.read_csv(fileobj, **kwargs)
 
+def pcon_from_csv(uploaded_file) -> pd.DataFrame:
+    attempts = [
+        {"sep": ";", "encoding": "utf-8-sig"},
+        {"sep": ";", "encoding": "utf-8"},
+        {"sep": ";", "encoding": "latin-1"},
+        {"sep": ",", "encoding": "utf-8-sig"},
+        {"sep": ",", "encoding": "utf-8"},
+        {"sep": ",", "encoding": "latin-1"},
+        {"sep": None, "engine": "python", "encoding": "utf-8-sig"},
+        {"sep": None, "engine": "python", "encoding": "utf-8"},
+        {"sep": None, "engine": "python", "encoding": "latin-1"},
+    ]
+    last_err, df = None, None
+    need = max(IDX_SHORT, IDX_VARIANT, IDX_ARTICLE, IDX_QTY)
+
+    for cfg in attempts:
+        try:
+            df = _try_read_csv(
+                uploaded_file,
+                header=None,
+                skiprows=PCON_SKIPROWS,
+                on_bad_lines="skip",
+                quoting=csv.QUOTE_MINIMAL,
+                **cfg
+            )
+            if df.shape[1] <= need:
+                last_err = ValueError(f"For få kolonner med cfg={cfg}, shape={df.shape}")
+                df = None
+                continue
+            break
+        except Exception as e:
+            last_err = e
+            df = None
+
+    if df is None:
+        raise ValueError(f"Kunne ikke parse pCon CSV. Sidste fejl: {last_err}")
+
+    sub = df.iloc[:, [IDX_SHORT, IDX_VARIANT, IDX_ARTICLE, IDX_QTY]].copy()
+    sub.columns = ["SHORT_TEXT","VARIANT_TEXT","ARTICLE_NO","QUANTITY"]
+    sub["ARTICLE_NO"]   = sub["ARTICLE_NO"].astype(str).str.strip()
+    sub["SHORT_TEXT"]   = sub["SHORT_TEXT"].astype(str).str.strip()
+    sub["VARIANT_TEXT"] = sub["VARIANT_TEXT"].astype(str).str.strip()
+    sub["QUANTITY"]     = pd.to_numeric(sub["QUANTITY"], errors="coerce").fillna(1).astype(int)
+    sub = sub[sub["ARTICLE_NO"].ne("")]
+    if sub.empty:
+        raise ValueError("pCon CSV blev læst, men indeholdt ingen gyldige rækker med ARTICLE_NO.")
+    return sub
+
+# ---------------- Lookups ----------------
 def fallback_key(article: str) -> str:
     base = re.sub(r"^SPECIAL-", "", str(article), flags=re.I)
     return base.split("-")[0].strip()
 
-# ---------------- Lookups ----------------
 def packshot_lookup(df_master: pd.DataFrame, article: str) -> str:
     hit = df_master.loc[df_master["ITEM NO."] == article, "IMAGE URL"]
     if not hit.empty: return str(hit.iloc[0])
@@ -110,7 +168,8 @@ def new_item_lookup(df_map: pd.DataFrame, article: str) -> str:
     hit = df_map.loc[df_map["OLD Item-variant"].apply(fallback_key) == base, "New Item No."]
     return str(hit.iloc[0]) if not hit.empty else ""
 
-# ---------------- Images ----------------
+# ---------------- Billeder ----------------
+@st.cache_data(ttl=3600)
 def fetch_image(url: str) -> bytes | None:
     if not url or not url.startswith("http"): return None
     try:
@@ -128,7 +187,8 @@ def preprocess(img: bytes, max_side=1200, quality=85) -> bytes:
             ratio = min(max_side/im.width, max_side/im.height)
             im = im.resize((int(im.width*ratio), int(im.height*ratio)), Image.Resampling.LANCZOS)
         buf = io.BytesIO(); im.save(buf, format="JPEG", quality=quality); return buf.getvalue()
-    except Exception: return img
+    except Exception:
+        return img
 
 # ---------------- PPT helpers ----------------
 def find_shape_by_text(slide, tag: str):
@@ -241,15 +301,6 @@ def main():
     st.set_page_config(page_title="Muuto PPT Generator", layout="wide")
     st.title("Muuto PPT Generator")
 
-    master_url = st.text_input(
-        "Master-data Google Sheets URL (edit eller export)",
-        value="https://docs.google.com/spreadsheets/d/1blj42SbFpszWGyOrDOUwyPDJr9K1NGpTMX6eZTbt_P4/edit?gid=1152340088#gid=1152340088"
-    )
-    mapping_url = st.text_input(
-        "Mapping (OLD Item-variant → New Item No.) Google Sheets URL (edit eller export)",
-        value="https://docs.google.com/spreadsheets/d/1S50it_q1BahpZCPW8dbuN7DyOMnyDgFIg76xIDSoXEk/edit?gid=1056617222#gid=1056617222"
-    )
-
     uploads = st.file_uploader(
         "Upload alle settings: CSV + Rendering JPG/PNG + valgfri Linedrawing. Mindst CSV og Rendering pr. setting.",
         type=["csv","jpg","jpeg","png"],
@@ -260,10 +311,10 @@ def main():
         if not os.path.exists(TEMPLATE_FILE):
             st.error(f"Skabelon '{TEMPLATE_FILE}' mangler."); st.stop()
 
-        master_df = load_master(master_url)
-        mapping_df = load_mapping(mapping_url)
+        master_df  = load_master()
+        mapping_df = load_mapping()
 
-        # gruppering pr. prefix før " - "
+        # gruppering pr. prefix (før " - ") eller første _/-
         groups_map: Dict[str, Dict[str, Any]] = {}
         for f in uploads or []:
             name, ext = os.path.splitext(f.name)
