@@ -8,7 +8,7 @@ import io, os, re, requests, csv
 from typing import List, Dict, Any, Tuple
 from copy import deepcopy
 
-# --------- Konstanter (kun i kode) ---------
+# --------- Constants (Code only) ---------
 TEMPLATE_FILE = "input-template.pptx"
 MASTER_URL = "https://docs.google.com/spreadsheets/d/1blj42SbFpszWGyOrDOUwyPDJr9K1NGpTMX6eZTbt_P4/edit?gid=1152340088#gid=1152340088"
 MAPPING_URL = "https://docs.google.com/spreadsheets/d/1S50it_q1BahpZCPW8dbuN7DyOMnyDgFIg76xIDSoXEk/edit?gid=1056617222#gid=1056617222"
@@ -66,44 +66,41 @@ def find_shape_by_placeholder(slide, tag: str):
 
 def set_text_preserve_style(shape, text: str):
     """
-    Indsætter tekst og bevarer stilen fra den første 'run'.
-    Håndterer indlejrede tags (f.eks. {{SETTINGNAME}}) og multiline-input.
-    Al tekst konverteres til STORE BOGSTAVER.
+    Inserts text and preserves style from the first 'run'.
+    Handles nested tags (e.g. {{SETTINGNAME}}) and multiline input.
+    All text is converted to UPPERCASE.
     """
     if not shape or not getattr(shape, "has_text_frame", False):
         return
     tf = shape.text_frame
     
-    # 1. Bestem endelig tekst (håndterer tag-erstatning og uppercase)
+    # 1. Determine final text (handles tag replacement and uppercase)
     final_text_content = text.upper()
     
     current_text_upper = tf.text.upper()
     if TAG_SETTINGNAME.upper() in current_text_upper:
-        # Hvis det er et indlejret tag, erstat kun tagget
+        # If it's a nested tag, only replace the tag within the original text
         final_text_content = current_text_upper.replace(TAG_SETTINGNAME.upper(), text.upper())
 
-    # 2. Fang stilen
+    # 2. Capture style
     font_name = font_size = font_bold = None
     if tf.paragraphs and tf.paragraphs[0].runs:
         r0 = tf.paragraphs[0].runs[0]
         font_name, font_size, font_bold = r0.font.name, r0.font.size, r0.font.bold
         
-    # 3. Ryd eksisterende indhold
-    # Sørg for at den første paragraf fjernes sidst, hvis vi genbruger den
+    # 3. Clear existing content
     while tf.paragraphs:
         p = tf.paragraphs[0]
         for r in list(p.runs): r.text = ""
         try: tf._element.remove(p._p)
         except Exception: break
             
-    # 4. Genopbyg indhold linje for linje
+    # 4. Rebuild content line by line
     lines = final_text_content.split('\n')
     
-    # Skab en ny paragraf til indsættelse (da vi fjernede den første i loopet)
+    # Add a new paragraph for insertion (since we removed the first one in the loop)
     p = tf.add_paragraph() 
     
-    # Vi bruger kun den første linie i `lines` til den paragraf, vi netop har oprettet (p)
-    # og opretter nye paragraffer for de resterende linjer (hvis det er en produktliste)
     for i, line in enumerate(lines):
         if i > 0:
             p = tf.add_paragraph()
@@ -133,7 +130,7 @@ def replace_image_by_tag(slide, tag: str, img_bytes: bytes):
         aspect_ratio = 1.0
         img_stream.seek(0)
     
-    # Beregn justerede dimensioner for at BEVARE ASPECT RATIO (fit into placeholder)
+    # Calculate adjusted dimensions to PRESERVE ASPECT RATIO (fit into placeholder)
     if (w / aspect_ratio) <= h:
         new_h = w / aspect_ratio
         new_w = w
@@ -141,15 +138,15 @@ def replace_image_by_tag(slide, tag: str, img_bytes: bytes):
         new_w = h * aspect_ratio
         new_h = h
 
-    # Centrer billedet i placeholderen
+    # Center the image in the placeholder
     new_left = left + (w - new_w) / 2
     new_top = top + (h - new_h) / 2
     
-    # Fjern den gamle placeholder
+    # Remove the old placeholder
     try: ph.element.getparent().remove(ph.element)
     except Exception: pass
     
-    # Indsæt det nye billede med bevaret aspect ratio
+    # Insert the new picture with preserved aspect ratio
     slide.shapes.add_picture(img_stream, new_left, new_top, width=new_w, height=new_h)
 
 
@@ -159,11 +156,11 @@ def duplicate_slide(prs: Presentation, slide):
         sp = shp.element
         sp.getparent().remove(sp)
     for shp in slide.shapes:
-        new_slide.shapes._spTree.append(deepcopy(shp._element))
+        new_slide.shapes._spTree.append(deepcopy(shape._element))
     return new_slide
 
 def remove_slide(prs: Presentation, index: int):
-    """Fjerner et slide fra præsentationen ved hjælp af dets index."""
+    """Removes a slide from the presentation by its index."""
     if index < 0 or index >= len(prs.slides._sldIdLst):
         return
         
@@ -182,7 +179,7 @@ def find_first_slide_with_tag(prs: Presentation, tag: str) -> Tuple[Any, int]:
 
 
 # ----------------------------------------------------------------------
-# --------- Data-loaders & Lookups (Med alle de tidligere rettelser) ----
+# --------- Data-loaders & Lookups -------------------------------------
 # ----------------------------------------------------------------------
 
 @st.cache_data
@@ -199,7 +196,7 @@ def load_master() -> pd.DataFrame:
     col_item = mapcol("ITEM NO.", ["Item No.","ITEM","SKU","Item Number","ItemNo","ITEM_NO"])
     col_img = mapcol("IMAGE URL", ["Image URL","Image Link","Picture URL","Packshot URL","ImageURL","IMAGE DOWNLOAD LINK","Image"])
     if not col_item or not col_img:
-        raise ValueError("Master mangler kolonner: ITEM NO. og/eller IMAGE URL (IMAGE DOWNLOAD LINK accepteres).")
+        raise ValueError("Master is missing columns: ITEM NO. and/or IMAGE URL (IMAGE DOWNLOAD LINK is accepted).")
     out = df.rename(columns={col_item:"ITEM NO.", col_img:"IMAGE URL"})[["ITEM NO.","IMAGE URL"]]
     for c in out.columns: out[c] = out[c].astype(str).str.strip()
     return out
@@ -219,7 +216,7 @@ def load_mapping() -> pd.DataFrame:
     col_new = mapcol("New Item No.", ["New Item Number","NEW ITEM NO.","NEW_ITEM_NO"])
     col_desc = mapcol("Description", ["Product Description","DESC","NAME","DESCRIPTION"])
     if not col_old or not col_new or not col_desc:
-        raise ValueError("Mapping mangler kolonner: OLD Item-variant, New Item No., Description.")
+        raise ValueError("Mapping is missing columns: OLD Item-variant, New Item No., Description.")
     out = df.rename(columns={
         col_old:"OLD Item-variant",
         col_new:"New Item No.",
@@ -251,13 +248,13 @@ def pcon_from_csv(uploaded_file) -> pd.DataFrame:
             df = _try_read_csv(uploaded_file, header=None, skiprows=PCON_SKIPROWS,
                                on_bad_lines="skip", quoting=csv.QUOTE_MINIMAL, **cfg)
             if df.shape[1] <= need:
-                last_err = ValueError(f"For få kolonner med cfg={cfg}, shape={df.shape}")
+                last_err = ValueError(f"Too few columns with cfg={cfg}, shape={df.shape}")
                 df = None; continue
             break
         except Exception as e:
             last_err = e; df = None
     if df is None:
-        raise ValueError(f"Kunne ikke parse pCon CSV. Sidste fejl: {last_err}")
+        raise ValueError(f"Could not parse pCon CSV. Last error: {last_err}")
     sub = df.iloc[:, [IDX_SHORT, IDX_VARIANT, IDX_ARTICLE, IDX_QTY]].copy()
     sub.columns = ["SHORT_TEXT","VARIANT_TEXT","ARTICLE_NO","QUANTITY"]
     sub["ARTICLE_NO"]    = sub["ARTICLE_NO"].astype(str).str.strip()
@@ -266,7 +263,7 @@ def pcon_from_csv(uploaded_file) -> pd.DataFrame:
     sub["QUANTITY"]      = pd.to_numeric(sub["QUANTITY"], errors="coerce").fillna(1).astype(int)
     sub = sub[sub["ARTICLE_NO"].ne("")]
     if sub.empty:
-        raise ValueError("pCon CSV blev læst, men indeholdt ingen gyldige rækker med ARTICLE_NO.")
+        raise ValueError("pCon CSV was read, but contained no valid rows with ARTICLE_NO.")
     return sub
 
 def fallback_key(article: str) -> str:
@@ -294,7 +291,7 @@ def mapping_description(map_df: pd.DataFrame, article: str) -> str:
     hit = map_df.loc[map_df["OLD Item-variant"].apply(fallback_key) == base, "Description"]
     return str(hit.iloc[0]) if not hit.empty else ""
 
-# --------- Billeder (Med robust fetching) ---------
+# --------- Image Utilities ---------
 @st.cache_data(ttl=3600)
 def fetch_image(url: str) -> bytes | None:
     if not url or not url.startswith("http"): return None
@@ -308,13 +305,11 @@ def fetch_image(url: str) -> bytes | None:
              
         return r.content
     except requests.exceptions.RequestException:
-        # Returnerer None ved netværksfejl (404, 500, timeout)
         return None
 
 def preprocess(img: bytes, max_side=1400, quality=85) -> bytes:
     try:
         im = Image.open(io.BytesIO(img))
-        # Konverter til RGB for at undgå problemer med pptx og PIL
         if im.mode in ("RGBA", "LA", "P"):
             im = im.convert("RGB")
             
@@ -323,23 +318,15 @@ def preprocess(img: bytes, max_side=1400, quality=85) -> bytes:
             im = im.resize((int(im.width*ratio), int(im.height*ratio)), Image.Resampling.LANCZOS)
             
         buf = io.BytesIO()
-        # Brug JPEG og optimering (ligner din gamle kode)
         im.save(buf, format="JPEG", quality=quality, optimize=True) 
         buf.seek(0)
         return buf.getvalue()
     except Exception:
-        # Hvis preprocess fejler, returner de originale bytes for at give pptx en chance
         return img 
 
 # --------- PPT-byggesten ---------
-def blank_layout(prs: Presentation):
-    for ly in prs.slide_layouts:
-        if ly.name and "blank" in ly.name.lower():
-            return ly
-    return prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[1]
-
 def create_product_list_text(items: List[Dict[str, Any]]) -> str:
-    """Genererer en multiline streng af produktlister i det ønskede format."""
+    """Generates a multiline string of product lists in the required format."""
     lines = []
     for it in items:
         article = str(it["article_no"])
@@ -367,14 +354,14 @@ def build_presentation(master_df: pd.DataFrame,
     setting_tpl, setting_idx = find_first_slide_with_tag(prs, TAG_SETTINGNAME)
     overview_tpl, overview_idx = find_first_slide_with_tag(prs, OVERVIEW_TITLE)
     
-    # 2. OVERVIEW SLIDE GENERERING
+    # 2. OVERVIEW SLIDE GENERATION
     if overview_renderings:
         if overview_tpl is not None:
             s = duplicate_slide(prs, overview_tpl)
             for i, rb in enumerate(overview_renderings[:12]):
                 replace_image_by_tag(s, OVERVIEW_TAGS[i], preprocess(rb))
         else:
-            # Fallback til blank slide
+            # Fallback to blank slide
             s = prs.slides.add_slide(blank_layout(prs))
             tx = s.shapes.add_textbox(Inches(0.6), Inches(0.3), Inches(9), Inches(0.6))
             set_text_preserve_style(tx, OVERVIEW_TITLE)
@@ -386,16 +373,15 @@ def build_presentation(master_df: pd.DataFrame,
                                              x0 + (i % cols)*cell_w, y0 + (i // cols)*cell_h,
                                              width=cell_w, height=cell_h)
 
-    # 3. SETTING SLIDE GENERERING
+    # 3. SETTING SLIDE GENERATION
     for gi, g in enumerate(groups, 1):
         
         base = setting_tpl if setting_tpl else prs.slides[0]
         s = duplicate_slide(prs, base)
         
-        # A. Udfyld SETTINGNAME (inkl. "SHOP THE LOOK - {{SETTINGNAME}}")
+        # A. Populate SETTINGNAME (including "SHOP THE LOOK - {{SETTINGNAME}}")
         setting_title_shape = find_shape_by_placeholder(s, TAG_SETTINGNAME)
         if setting_title_shape:
-            # set_text_preserve_style er opdateret til at håndtere korrekt erstatning og uppercase
             set_text_preserve_style(setting_title_shape, g["name"]) 
 
         # B. Rendering, Linedrawing, Packshots, Product Descriptions
@@ -405,26 +391,25 @@ def build_presentation(master_df: pd.DataFrame,
             replace_image_by_tag(s, TAG_LINEDRAWING, preprocess(g["linedrawing_bytes"]))
 
         for idx, it in enumerate(g["items"][:12]):
-            # Indsættelse af packshot med robust fetching
+            # Packshot insertion
             if it.get("packshot_url"):
                 raw = fetch_image(it["packshot_url"])
                 if raw:
                     replace_image_by_tag(s, PACKSHOT_TAGS[idx], preprocess(raw))
                     
-            # Indsættelse af produktbeskrivelse
+            # Product Description insertion
             desc_tag_shape = find_shape_by_placeholder(s, PROD_DESC_TAGS[idx])
             if desc_tag_shape:
                 set_text_preserve_style(desc_tag_shape, it.get("desc_text",""))
 
-        # C. Produktoversigt som formateret tekst i {{ProductsinSettingList}}
+        # C. Product Overview list in {{ProductsinSettingList}}
         product_list_text = create_product_list_text(g["items"])
         list_shape = find_shape_by_placeholder(s, TAG_PRODUCTS_LIST)
         
         if list_shape:
-            # set_text_preserve_style er opdateret til at håndtere multiline tekst og uppercase
             set_text_preserve_style(list_shape, product_list_text)
 
-    # 4. FJERN DE ORIGINALE TEMPLATE SLIDES
+    # 4. REMOVE ORIGINAL TEMPLATE SLIDES
     indices_to_remove = []
     if overview_tpl and overview_idx is not None:
         indices_to_remove.append(overview_idx)
@@ -444,25 +429,36 @@ def build_presentation(master_df: pd.DataFrame,
 def main():
     st.set_page_config(page_title="Muuto PPT Generator", layout="wide")
     st.title("Muuto PPT Generator")
+    
+    # NEW: Application Description
+    st.markdown(
+        """
+        This tool automatically generates a **Shop the Look** PowerPoint presentation
+        based on your pCon CSV exports and corresponding image files.
+        It groups CSVs, Renderings, and Linedrawings by their file name prefix (e.g., 'Dining 01') 
+        to create individual setting slides.
+        """
+    )
+    st.markdown("---")
 
     uploads = st.file_uploader(
-        "Upload pr. setting: CSV + Rendering (JPG/PNG) + valgfri Linedrawing (JPG/PNG).",
+        "Upload per setting: CSV + Rendering (JPG/PNG) + optional Linedrawing (JPG/PNG).",
         type=["csv","jpg","jpeg","png"],
         accept_multiple_files=True
     )
 
-    if st.button("Generér PPT", type="primary"):
+    if st.button("Generate PPT", type="primary"):
         if not os.path.exists(TEMPLATE_FILE):
-            st.error(f"Skabelon '{TEMPLATE_FILE}' mangler."); st.stop()
+            st.error(f"Template file '{TEMPLATE_FILE}' is missing."); st.stop()
 
-        # BRUGERVENLIG ENKEL SPINNER
-        with st.spinner("Arbejder på at generere præsentationen... Dette kan tage et øjeblik"):
+        # USER-FRIENDLY SINGLE SPINNER
+        with st.spinner("Processing files and generating presentation... This may take a moment."):
             try:
-                # 1. Indlæsning af data
+                # 1. Load data
                 master_df  = load_master()
                 mapping_df = load_mapping()
     
-                # 2. Gruppering af filer
+                # 2. Group files
                 groups_map: Dict[str, Dict[str, Any]] = {}
                 for f in uploads or []:
                     name, ext = os.path.splitext(f.name)
@@ -489,10 +485,10 @@ def main():
                 settings, overview_imgs = [], []
                 for base, data in groups_map.items():
                     if not data["csv"] or not data["rendering"]:
-                        st.warning(f"⚠️ Springer over '{data['name']}' – mangler CSV eller Rendering.")
+                        st.warning(f"⚠️ Skipping '{data['name']}' – requires both CSV and Rendering.")
                         continue
     
-                    # 3. Læsning af CSV
+                    # 3. Read CSV and prepare items
                     df = pcon_from_csv(data["csv"])
     
                     items = []
@@ -519,13 +515,13 @@ def main():
                     })
     
                 if not settings:
-                    st.error("❌ Ingen gyldige settings fundet (kræver CSV og Rendering for mindst én gruppe).")
+                    st.error("❌ No valid settings found (Requires CSV and Rendering for at least one group).")
                     st.stop()
     
-                # 4. Generering af PowerPoint
+                # 4. Generate PowerPoint
                 ppt_bytes = build_presentation(master_df, mapping_df, settings, overview_imgs)
                 
-                st.success("✅ PowerPoint genereret succesfuldt!")
+                st.success("✅ PowerPoint generated successfully!")
     
                 st.download_button(
                     "Download PPT",
@@ -534,7 +530,7 @@ def main():
                     mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
                 )
             except Exception as e:
-                st.error("❌ Fejl i generering: Prøv venligst igen.")
+                st.error("❌ Generation error: Please try again.")
                 st.exception(e)
 
 if __name__ == "__main__":
