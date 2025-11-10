@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 from pptx import Presentation
 from pptx.util import Inches, Pt
+from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from PIL import Image
 import io, os, re, requests, csv
 from typing import List, Dict, Any, Tuple
@@ -50,35 +51,40 @@ def _norm_placeholder_text(s: str) -> str:
 def _norm_tag(tag: str) -> str:
     return _norm_placeholder_text(tag)
 
-def find_shape_by_placeholder(slide, tag: str):
+def find_shape_by_placeholder(slide, tag: str, find_placeholder_type=False):
     """
     Finds a shape/placeholder by its text content (tag). 
-    Searches through all shapes and placeholders.
+    If find_placeholder_type is True, it returns the shape only if it's a true placeholder.
     """
     want = _norm_tag(tag)
     
-    # Check all shapes (most robust for non-standard text/image boxes)
+    # 1. Check true placeholders first (essential for images/layout fields)
+    for ph in getattr(slide, "placeholders", []):
+        try:
+            if ph.text and want in _norm_placeholder_text(ph.text):
+                return ph
+            # Fallback: check placeholder name/element id if text is missing
+            if want in _norm_tag(getattr(ph, 'name', '')):
+                return ph
+        except AttributeError:
+            continue
+            
+    if find_placeholder_type:
+        return None # Return None if only placeholders were requested and not found
+
+    # 2. Check all other shapes (robust for non-standard text boxes)
     for shp in slide.shapes:
-        # Check if the shape has text (for text placeholders)
         if getattr(shp, "has_text_frame", False) and shp.text_frame:
             txt = shp.text_frame.text or ""
             if want in _norm_placeholder_text(txt):
                 return shp
         
-        # Check if shape name contains the tag (for named image/picture shapes)
         try:
-            # Note: This is a fallback if the image is named manually and not a text box.
             if shp.name and want in _norm_tag(shp.name):
                 return shp
         except Exception:
             pass
                 
-    # Check all placeholders (for standard placeholders)
-    for shp in getattr(slide, "placeholders", []):
-        if getattr(shp, "has_text_frame", False) and shp.text_frame:
-            txt = shp.text_frame.text or ""
-            if want in _norm_placeholder_text(txt):
-                return shp
     return None
 
 def set_text_preserve_style(shape, text: str):
@@ -91,31 +97,24 @@ def set_text_preserve_style(shape, text: str):
         return
     tf = shape.text_frame
     
-    # 1. Determine final text (handles tag replacement and uppercase)
     final_text_content = text.upper()
     
     current_text_upper = tf.text.upper()
     if TAG_SETTINGNAME.upper() in current_text_upper:
-        # If it's a nested tag, only replace the tag within the original text
         final_text_content = current_text_upper.replace(TAG_SETTINGNAME.upper(), text.upper())
 
-    # 2. Capture style
     font_name = font_size = font_bold = None
     if tf.paragraphs and tf.paragraphs[0].runs:
         r0 = tf.paragraphs[0].runs[0]
         font_name, font_size, font_bold = r0.font.name, r0.font.size, r0.font.bold
         
-    # 3. Clear existing content
     while tf.paragraphs:
         p = tf.paragraphs[0]
         for r in list(p.runs): r.text = ""
         try: tf._element.remove(p._p)
         except Exception: break
             
-    # 4. Rebuild content line by line
     lines = final_text_content.split('\n')
-    
-    # Add a new paragraph for insertion (since we removed the first one in the loop)
     p = tf.add_paragraph() 
     
     for i, line in enumerate(lines):
@@ -132,8 +131,28 @@ def set_text_preserve_style(shape, text: str):
 
 def replace_image_by_tag(slide, tag: str, img_bytes: bytes):
     if not img_bytes: return
+    
+    # Prøv at finde som ægte Picture Placeholder (mest stabil)
+    ph = find_shape_by_placeholder(slide, tag, find_placeholder_type=True) 
+    
+    # Hvis en ægte placeholder findes, og den kan acceptere billeder:
+    if ph and getattr(ph.placeholder_format, 'type', None) in [PP_PLACEHOLDER.PICTURE, PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT]:
+        try:
+            # Brug den indbyggede metode, som respekterer Master Slide-formatering
+            img_stream = io.BytesIO(img_bytes)
+            ph.insert_picture(img_stream)
+            img_stream.seek(0)
+            return
+        except Exception:
+            # Hvis insert_picture fejler, falder vi tilbage til den aggressive erstatning
+            pass
+    
+    # Hvis det IKKE var en ægte placeholder (eller insert_picture fejlede), 
+    # falder vi tilbage til at finde det som en almindelig shape og erstatte aggressivt:
+    
     ph = find_shape_by_placeholder(slide, tag)
     if not ph: return
+    
     left, top, w, h = ph.left, ph.top, ph.width, ph.height
     
     img_stream = io.BytesIO(img_bytes)
@@ -155,15 +174,14 @@ def replace_image_by_tag(slide, tag: str, img_bytes: bytes):
         new_w = h * aspect_ratio
         new_h = h
 
-    # Center the image in the placeholder
     new_left = left + (w - new_w) / 2
     new_top = top + (h - new_h) / 2
     
-    # Remove the old placeholder
+    # Remove the old shape element (aggressive cleanup)
     try: ph.element.getparent().remove(ph.element)
     except Exception: pass
     
-    # Insert the new picture with preserved aspect ratio
+    # Insert the new picture
     slide.shapes.add_picture(img_stream, new_left, new_top, width=new_w, height=new_h)
 
 
@@ -177,7 +195,6 @@ def duplicate_slide(prs: Presentation, slide):
     return new_slide
 
 def remove_slide(prs: Presentation, index: int):
-    """Removes a slide from the presentation by its index."""
     if index < 0 or index >= len(prs.slides._sldIdLst):
         return
         
@@ -200,9 +217,58 @@ def blank_layout(prs: Presentation):
             return ly
     return prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[1]
 
+# --- Template Creator (For UI Download) ---
+def create_simple_template_pptx() -> bytes:
+    """Creates a simple, functional PowerPoint template with all required placeholders."""
+    prs = Presentation()
+    
+    blank_layout = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[1]
+    
+    # --- OVERVIEW Slide ---
+    s_overview = prs.slides.add_slide(blank_layout)
+    s_overview.shapes.add_textbox(Inches(0.5), Inches(0.2), Inches(9), Inches(0.5)).text_frame.text = OVERVIEW_TITLE
+    
+    x, y = Inches(0.5), Inches(0.8)
+    w, h = Inches(2.3), Inches(2.3)
+    for i in range(12):
+        col, row = i % 4, i // 4
+        tx = s_overview.shapes.add_textbox(x + col * Inches(2.5), y + row * Inches(2.5), w, h)
+        tx.text_frame.text = OVERVIEW_TAGS[i]
+
+    # --- SETTING Slide ---
+    s_setting = prs.slides.add_slide(blank_layout)
+    setting_title_box = s_setting.shapes.add_textbox(Inches(0.5), Inches(0.2), Inches(9), Inches(0.5))
+    setting_title_box.text_frame.text = f"SHOP THE LOOK - {TAG_SETTINGNAME}"
+    setting_title_box.text_frame.paragraphs[0].runs[0].font.bold = True
+    
+    s_setting.shapes.add_textbox(Inches(0.5), Inches(1.0), Inches(4.5), Inches(4)).text_frame.text = TAG_RENDERING
+    s_setting.shapes.add_textbox(Inches(5.5), Inches(1.0), Inches(4.5), Inches(4)).text_frame.text = TAG_LINEDRAWING
+    
+    x, y = Inches(0.5), Inches(5.5)
+    w_pack, w_desc = Inches(0.5), Inches(1.9)
+    h_slot = Inches(0.4)
+    
+    for i in range(12):
+        slot_x = x + (i // 4) * Inches(3.2)
+        slot_y = y + (i % 4) * h_slot
+        
+        pack_box = s_setting.shapes.add_textbox(slot_x, slot_y, w_pack, h_slot)
+        pack_box.text_frame.text = PACKSHOT_TAGS[i]
+        
+        desc_box = s_setting.shapes.add_textbox(slot_x + w_pack + Inches(0.1), slot_y, w_desc, h_slot)
+        desc_box.text_frame.text = PROD_DESC_TAGS[i]
+
+    if len(prs.slides) > 2:
+        remove_slide(prs, 0)
+    
+    buf = io.BytesIO()
+    prs.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
 
 # ----------------------------------------------------------------------
-# --------- Data-loaders & Lookups -------------------------------------
+# --------- Data-loaders & Lookups (Unchanged) -------------------------
 # ----------------------------------------------------------------------
 
 @st.cache_data
@@ -314,7 +380,7 @@ def mapping_description(map_df: pd.DataFrame, article: str) -> str:
     hit = map_df.loc[map_df["OLD Item-variant"].apply(fallback_key) == base, "Description"]
     return str(hit.iloc[0]) if not hit.empty else ""
 
-# --------- Image Utilities ---------
+# --------- Image Utilities (Unchanged) ---------
 @st.cache_data(ttl=3600)
 def fetch_image(url: str) -> bytes | None:
     if not url or not url.startswith("http"): return None
@@ -347,7 +413,7 @@ def preprocess(img: bytes, max_side=1400, quality=85) -> bytes:
     except Exception:
         return img 
 
-# --------- PPT-byggesten ---------
+# --------- PPT-byggesten (Opdateret) ---------
 
 def add_products_table_on_blank(prs: Presentation, title: str, rows: List[List[str]]):
     """Adds a new slide with product list as an unformatted table."""
@@ -363,11 +429,9 @@ def add_products_table_on_blank(prs: Presentation, title: str, rows: List[List[s
     left, top, width, height = Inches(0.6), Inches(1.2), Inches(9.2), Inches(5.5)
     
     # Adds table with default/unformatted style
-    # We use table style 3 for a basic, unstyled look if possible
     try:
         tbl_shape = s.shapes.add_table(rows=len(data), cols=3, left=left, top=top, width=width, height=height)
     except Exception:
-        # Fallback if table creation fails
         return
 
     tbl = tbl_shape.table
@@ -380,7 +444,6 @@ def add_products_table_on_blank(prs: Presentation, title: str, rows: List[List[s
             # Apply font size to retain style consistency across the app
             for p in cell.text_frame.paragraphs:
                 for run in p.runs: 
-                    # Set font size to 12pt and ensure it uses the table style's font
                     run.font.size = Pt(12) 
     return s
 
@@ -482,6 +545,26 @@ def main():
         """
     )
     st.markdown("---")
+    
+    # --- Template Download Section ---
+    st.subheader("Template Setup")
+    if not os.path.exists(TEMPLATE_FILE):
+        st.warning(f"Template file '{TEMPLATE_FILE}' not found. **Please use the download button below to generate the simple, compatible template.**")
+    else:
+        st.success(f"Template file '{TEMPLATE_FILE}' found. Proceed to file upload.")
+        
+    if st.button("Download Template File (input-template.pptx)"):
+        with st.spinner("Generating simple template..."):
+            template_bytes = create_simple_template_pptx()
+            st.download_button(
+                "Click to Download Template",
+                data=template_bytes,
+                file_name=TEMPLATE_FILE,
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            )
+    st.markdown("---")
+    # --- End Template Download Section ---
+
 
     uploads = st.file_uploader(
         "Upload per setting: CSV + Rendering (JPG/PNG) + optional Linedrawing (JPG/PNG).",
@@ -491,7 +574,7 @@ def main():
 
     if st.button("Generate PPT", type="primary"):
         if not os.path.exists(TEMPLATE_FILE):
-            st.error(f"Template file '{TEMPLATE_FILE}' is missing."); st.stop()
+            st.error(f"Template file '{TEMPLATE_FILE}' is missing. Please use the download button above to generate it."); st.stop()
 
         # USER-FRIENDLY SINGLE SPINNER
         with st.spinner("Processing files and generating presentation... This may take a moment."):
@@ -572,8 +655,16 @@ def main():
                     mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
                 )
             except Exception as e:
-                st.error("❌ Generation error: Please try again.")
-                st.exception(e)
+                # Catch specific data errors vs unexpected errors
+                error_message = str(e)
+                if "Master is missing columns" in error_message or "Mapping is missing columns" in error_message:
+                     st.error(f"❌ Data Error: {error_message}")
+                elif "Template file" in error_message:
+                     st.error(f"❌ Template Error: {error_message}. Please use the 'Download Template File' button to fix.")
+                else:
+                    st.error("❌ Generation Error: An unexpected error occurred. Please try again or check logs for details.")
+                    st.exception(e)
+                st.stop() 
 
 if __name__ == "__main__":
     main()
