@@ -11,9 +11,16 @@ import re
 from typing import List, Dict, Any, Tuple
 from collections import defaultdict
 import numpy as np
-import requests # Nødvendigt for at hente billeder via URL
+import requests
+import os # Nødvendigt for at læse den hardcodede skabelon
 
 # --- KONSTANTER ---
+
+# Hardcodede URL'er til Google Sheets (Skal være publiceret som CSV)
+LIBRARY_DEFAULT_URL = "https://docs.google.com/spreadsheets/d/1h3yaq094mBa5Yadfi9Nb_Wrnzj3gIH2DviIfU0DdwsQ/export?format=csv&gid=437866492"
+MASTER_DEFAULT_URL = "https://docs.google.com/spreadsheets/d/1blj42SbFpszWGyOrDOUwyPDJr9K1NGpTMX6eZTbt_P4/export?format=csv&gid=194572316"
+TEMPLATE_FILENAME = "input-template.pptx" # Skal ligge i samme mappe som app.py
+
 PCON_ARTICLE_NO_COL = 17
 PCON_QUANTITY_COL = 30
 PCON_SHORT_TEXT_COL = 2
@@ -23,7 +30,6 @@ PRODUCT_PLACEHOLDERS = [f"PRODUCT DESCRIPTION {i}" for i in range(1, 13)]
 PACKSHOT_PLACEHOLDERS = [f"ProductPackshot{i}" for i in range(1, 13)]
 ACCESSORY_PLACEHOLDERS = [f"accessory{i}" for i in range(1, 7)]
 OVERVIEW_RENDER_PLACEHOLDERS = [f"Rendering{i}" for i in range(1, 13)]
-# Antages at denne kolonne eksisterer i Master Data Sheets
 MASTER_DATA_PACKSHOT_COL = 'IMAGE URL' 
 
 # --- DATA OG FILHÅNDTERINGSFUNKTIONER ---
@@ -60,7 +66,6 @@ def load_library_data(input_url: str, expected_cols: List[str], source_name: str
         raise ValueError("URL mangler.")
 
     try:
-        # Læser direkte fra CSV-eksport URL'en
         df = pd.read_csv(input_url) 
         
         missing_cols = [col for col in expected_cols if col not in df.columns]
@@ -77,7 +82,7 @@ def load_library_data(input_url: str, expected_cols: List[str], source_name: str
         st.error(f"Fejl under indlæsning af '{source_name}' fra URL: {e}. Tjek URL'en og om dokumentet er offentliggjort som CSV-eksport.")
         raise
 
-@st.cache_data(ttl=3600) # Cache i 1 time for at undgå gentagne netværkskald
+@st.cache_data(ttl=3600)
 def fetch_image_bytes_from_url(url: str, article_no: str) -> bytes | None:
     """Henter billed-bytes fra en given URL."""
     if not url or not url.startswith('http'):
@@ -85,7 +90,7 @@ def fetch_image_bytes_from_url(url: str, article_no: str) -> bytes | None:
     
     try:
         response = requests.get(url, timeout=10)
-        response.raise_for_status() # Hæv exception for dårlige statuskoder (4xx eller 5xx)
+        response.raise_for_status()
         
         content_type = response.headers.get('Content-Type', '').lower()
         if 'image' not in content_type:
@@ -364,14 +369,13 @@ def replace_image(slide, placeholder_tag: str, image_bytes: bytes, crop_to_frame
     except Exception as e:
         st.warning(f"Advarsel: Kunne ikke indsætte billede for placeholder '{placeholder_tag}'. Fejl: {e}")
 
-# Rettelser på type hints: Erstatter Presentation.slide med Any
 def find_first_slide_with_tag(prs: Presentation, tag: str) -> Tuple[Any, int]:
     """Finder det første slide, der indeholder en bestemt placeholder-tag (til skabelonsøgning)."""
     for i, slide in enumerate(prs.slides):
         for shape in slide.shapes:
             if shape.has_text_frame and shape.text_frame.text.strip().upper() == tag.upper():
                 return slide, i
-    st.error(f"Fejl: Skabelonen ('input-template.pptx') mangler en slide med placeholder-tekst: {tag}")
+    st.error(f"Fejl: Skabelonen ('{TEMPLATE_FILENAME}') mangler en slide med placeholder-tekst: {tag}")
     raise ValueError("Placeholder ikke fundet i skabelonen.")
 
 def get_slide_index_by_tag(prs: Presentation, tag: str) -> int:
@@ -510,42 +514,14 @@ def main():
     st.title("📄 Muuto PowerPoint Generator")
     st.markdown("---")
 
-    # --- Sektion: 1. Opslagsfiler og Skabelon ---
-    st.header("1. Opslagsfiler (Google Sheets) og Skabelon")
+    # --- Sektion: 1. Opslagsfiler og Skabelon (FJERNET FRA UI) ---
     
-    # Standard URL'er (Skal være publiceret som CSV)
-    LIBRARY_DEFAULT_URL = "https://docs.google.com/spreadsheets/d/1h3yaq094mBa5Yadfi9Nb_Wrnzj3gIH2DviIfU0DdwsQ/export?format=csv&gid=437866492"
-    MASTER_DEFAULT_URL = "https://docs.google.com/spreadsheets/d/1blj42SbFpszWGyOrDOUwyPDJr9K1NGpTMX6eZTbt_P4/export?format=csv&gid=194572316"
-
-    col_lib, col_master, col_template = st.columns(3)
-
-    with col_lib:
-        library_url = st.text_input(
-            "URL til **Library_data**", 
-            key="library_url", 
-            value=LIBRARY_DEFAULT_URL
-        )
-    with col_master:
-        master_url = st.text_input(
-            "URL til **Muuto Master Data**", 
-            key="master_url", 
-            value=MASTER_DEFAULT_URL
-        )
-    with col_template:
-        st.write("Upload **input-template.pptx** (Kræves)")
-        template_file = st.file_uploader(
-            "input-template.pptx", 
-            type=['pptx'], 
-            key="template_upload",
-            label_visibility="collapsed" # Skjul standardlabel
-        )
-        if template_file:
-            st.success("Skabelon uploadet.")
+    st.info(f"Appen bruger den hardcodede skabelon **'{TEMPLATE_FILENAME}'** og Google Sheets URL'er til opslag. Sørg for at skabelonen ligger i samme mappe som `app.py`.")
         
     st.markdown("---")
     
     # --- Sektion: 2. Upload Alle Setting Filer ---
-    st.header("2. Upload Alle Setting Filer")
+    st.header("1. Upload Alle Setting Filer")
     st.warning("Upload alle filer (CSV/XLSX, Rendering.jpg, Floorplan.jpg) på én gang. Filerne skal have et **fælles prefix** for at blive grupperet.")
 
     st.write("Multi-upload: CSV/XLSX, Rendering JPG/PNG, Floorplan JPG/PNG")
@@ -554,7 +530,7 @@ def main():
         type=['csv', 'xlsx', 'jpg', 'jpeg', 'png'], 
         accept_multiple_files=True,
         key="all_setting_files_upload",
-        label_visibility="collapsed" # Skjul standardlabel
+        label_visibility="collapsed"
     )
     
     if all_setting_files:
@@ -574,17 +550,16 @@ def main():
     st.markdown("---")
     
     # --- Sektion: 3. Generér PowerPoint ---
-    st.header("3. Generér PowerPoint")
+    st.header("2. Generér PowerPoint")
     
     if st.button("🚀 Generér PowerPoint", type="primary"):
         
         # --- 1. Validering og Gruppering ---
         errors = []
-        if not template_file:
-            errors.append("❌ Skabelonen (input-template.pptx) mangler.")
-        if not library_url or not master_url:
-            errors.append("❌ URL til Library eller Master Data mangler.")
-            
+        
+        if not os.path.exists(TEMPLATE_FILENAME):
+            errors.append(f"❌ Skabelonen ('{TEMPLATE_FILENAME}') blev ikke fundet i appens mappe.")
+
         if errors:
             for error in errors:
                 st.error(error)
@@ -620,12 +595,12 @@ def main():
         # --- 2. Databehandling ---
         with st.spinner("Læser opslagsdata og skabelon..."):
             try:
-                # Bemærk: 'IMAGE URL' kolonnen forventes her
-                library_df = load_library_data(library_url, ['PRODUCT', 'EUR ITEM NO.'], 'Library_data')
-                master_df = load_library_data(master_url, ['ITEM NO.', MASTER_DATA_PACKSHOT_COL], 'Muuto Master Data') 
+                # Oplæsning fra hardcodede konstanter
+                library_df = load_library_data(LIBRARY_DEFAULT_URL, ['PRODUCT', 'EUR ITEM NO.'], 'Library_data')
+                master_df = load_library_data(MASTER_DEFAULT_URL, ['ITEM NO.', MASTER_DATA_PACKSHOT_COL], 'Muuto Master Data') 
                 
-                template_bytes = template_file.read()
-                prs = Presentation(io.BytesIO(template_bytes))
+                # Indlæs den lokale skabelonfil
+                prs = Presentation(TEMPLATE_FILENAME)
             except Exception as e:
                 st.error(f"Kritisk fejl under indlæsning af skabelon eller opslagsdata: {e}")
                 st.stop()
