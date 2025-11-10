@@ -3,7 +3,6 @@
 import streamlit as st
 import pandas as pd
 from pptx import Presentation
-# Importer nødvendige pptx/PIL/io moduler (forkortet for plads, men de skal være inkluderet)
 from pptx.util import Inches
 from pptx.enum.shapes import MSO_SHAPE
 from PIL import Image
@@ -12,6 +11,7 @@ import re
 from typing import List, Dict, Any, Tuple
 from collections import defaultdict
 import numpy as np
+import requests # NYT: Nødvendigt for at hente billeder via URL
 
 # --- Konstanter ---
 PCON_ARTICLE_NO_COL = 17
@@ -24,12 +24,34 @@ PACKSHOT_PLACEHOLDERS = [f"ProductPackshot{i}" for i in range(1, 13)]
 ACCESSORY_PLACEHOLDERS = [f"accessory{i}" for i in range(1, 7)]
 OVERVIEW_RENDER_PLACEHOLDERS = [f"Rendering{i}" for i in range(1, 13)]
 
-# --- HJÆLPEFUNKTIONER (Beholdes uændret) ---
+# --- NY HJÆLPEFUNKTION TIL URL HENTNING ---
+
+@st.cache_data(ttl=3600) # Cache i 1 time for at undgå gentagne netværkskald
+def fetch_image_bytes_from_url(url: str, article_no: str) -> bytes | None:
+    """Henter billed-bytes fra en given URL."""
+    if not url or not url.startswith('http'):
+        return None
+    
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status() # Hæv exception for dårlige statuskoder (4xx eller 5xx)
+        
+        # Valider at vi fik et billede
+        content_type = response.headers.get('Content-Type', '').lower()
+        if 'image' not in content_type:
+            # st.warning(f"Advarsel: URL for {article_no} er ikke et billede (Content-Type: {content_type}).")
+            return None
+
+        return response.content
+    except requests.exceptions.RequestException as e:
+        st.warning(f"Advarsel: Kunne ikke hente packshot for {article_no} fra URL. Fejl: {e}")
+        return None
+
+# --- EKSISTERENDE HJÆLPEFUNKTIONER ---
 
 @st.cache_data
 def load_pcon_file(uploaded_file) -> pd.DataFrame:
-    # Funktion til at indlæse pCon-filen... (Beholdes uændret)
-    # ... (Se tidligere kode for detaljer)
+    # Funktion til at indlæse pCon-filen... (Uændret)
     if uploaded_file.name.endswith('.csv'):
         df = pd.read_csv(uploaded_file, skiprows=PCON_SKIPROWS)
     else:
@@ -52,8 +74,7 @@ def load_pcon_file(uploaded_file) -> pd.DataFrame:
 
 @st.cache_data
 def load_library_data(input_url: str, expected_cols: List[str], source_name: str) -> pd.DataFrame:
-    # Funktion til at indlæse data fra Google Sheets URL... (Beholdes uændret)
-    # ... (Se tidligere kode for detaljer)
+    # Funktion til at indlæse data fra Google Sheets URL... (Uændret)
     if not input_url.startswith('http'):
         st.error(f"Fejl: '{source_name}' mangler en gyldig URL.")
         raise ValueError("URL mangler.")
@@ -75,35 +96,388 @@ def load_library_data(input_url: str, expected_cols: List[str], source_name: str
         st.error(f"Fejl under indlæsning af '{source_name}' fra URL: {e}. Tjek URL'en og om dokumentet er offentliggjort som CSV-eksport.")
         raise
         
-# Beholder: fallback_key, match_library, match_master, get_product_description, build_products_list
-# Beholder: preprocess_image
-# Beholder: PowerPoint-funktioner (get_placeholder_by_tag, fit_replace_text, replace_image, etc.)
+def fallback_key(article_no: str) -> str:
+    # ... (Uændret)
+    if pd.isna(article_no) or not article_no:
+        return ""
+    
+    base_key = re.sub(r'^SPECIAL-', '', article_no, flags=re.IGNORECASE)
+    base_key = base_key.split('-')[0].strip()
+    
+    return base_key
 
-# --- NY FILGRUPPERINGSFUNKTION ---
+def match_library(row: pd.Series, library_df: pd.DataFrame) -> Dict[str, Any]:
+    # ... (Uændret)
+    article_no = row['ARTICLE_NO']
+    
+    primary_match = library_df[library_df['EUR ITEM NO.'] == article_no]
+    
+    if not primary_match.empty:
+        if 'PRODUCT' in primary_match.columns and 'ALL COLORS' in primary_match['PRODUCT'].iloc[0]:
+            pass 
+        else:
+            return primary_match.iloc[0].to_dict()
+
+    key = fallback_key(article_no)
+    if key:
+        fallback_match = library_df[library_df['EUR ITEM NO.'].apply(fallback_key) == key]
+        if not fallback_match.empty:
+            return fallback_match.iloc[0].to_dict()
+            
+    return {}
+
+def match_master(row: pd.Series, master_df: pd.DataFrame) -> Dict[str, Any]:
+    # ... (Uændret)
+    article_no = row['ARTICLE_NO']
+    
+    primary_match = master_df[master_df['ITEM NO.'] == article_no]
+    
+    if not primary_match.empty:
+        return primary_match.iloc[0].to_dict()
+
+    key = fallback_key(article_no)
+    if key:
+        fallback_match = master_df[master_df['ITEM NO.'].apply(fallback_key) == key]
+        if not fallback_match.empty:
+            return fallback_match.iloc[0].to_dict()
+            
+    return {}
+
+def get_product_description(row: pd.Series, library_match: Dict[str, Any]) -> str:
+    # ... (Uændret)
+    if library_match and 'PRODUCT' in library_match:
+        return str(library_match['PRODUCT'])
+    else:
+        short_text = str(row['SHORT_TEXT']).strip()
+        variant_text = str(row['VARIANT_TEXT']).strip()
+        
+        if not variant_text or variant_text.upper() == 'LIGHT OPTION: OFF':
+            return short_text
+        else:
+            return f"{short_text} – {variant_text}"
+
+def build_products_list(pcon_df: pd.DataFrame, library_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[str, List[Dict[str, Any]], List[str]]:
+    """Genererer den sorterede produktliste og forbereder produktdata, inkl. packshot URL'er."""
+    
+    product_lines = []
+    product_details = []
+    warnings = []
+    
+    # KIG HER: Vi antager at 'IMAGE URL' er den korrekte kolonne i Master Data
+    PACKSHOT_URL_COL = 'IMAGE URL'
+    if PACKSHOT_URL_COL not in master_df.columns:
+        warnings.append(f"ADVARSEL: Kolonnen '{PACKSHOT_URL_COL}' blev ikke fundet i Master Data. Packshots vil blive tomme.")
+        
+    for _, row in pcon_df.iterrows():
+        qty = int(row['QUANTITY']) if pd.notna(row['QUANTITY']) and row['QUANTITY'] else 1
+        library_match = match_library(row, library_df)
+        master_match = match_master(row, master_df) # NYT: Matcher Master Data
+        
+        product_desc = get_product_description(row, library_match)
+        
+        list_line = f"{qty} X {product_desc}"
+        product_lines.append(list_line)
+        
+        packshot_url = master_match.get(PACKSHOT_URL_COL, '') if PACKSHOT_URL_COL in master_df.columns else ''
+        
+        if not packshot_url and master_match:
+             warnings.append(f"Advarsel: Masterdata-match for {row['ARTICLE_NO']} fundet, men Packshot URL'en er tom i kolonnen '{PACKSHOT_URL_COL}'.")
+
+        detail = {
+            'description': product_desc,
+            'article_no': row['ARTICLE_NO'],
+            'library_match': library_match,
+            'packshot_url': packshot_url, # NYT: URL til packshot
+            'pcon_row': row
+        }
+        product_details.append(detail)
+        
+        if not library_match:
+            warnings.append(f"Advarsel: Ingen Library-match (primær eller fallback) for artikel: {row['ARTICLE_NO']}. Bruger pCon-tekst.")
+
+    def sort_key(line):
+        return line.split(' X ', 1)[-1].lower() if ' X ' in line else line.lower()
+        
+    sorted_lines = sorted(product_lines, key=sort_key)
+    
+    return '\n'.join(sorted_lines), product_details, warnings
+
+def preprocess_image(img_bytes: bytes) -> bytes:
+    # ... (Uændret)
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+            
+        max_size = 1200
+        if img.width > max_size or img.height > max_size:
+            ratio = min(max_size / img.width, max_size / img.height)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+            
+        output = io.BytesIO()
+        img.save(output, format='JPEG', quality=85) 
+        return output.getvalue()
+        
+    except Exception as e:
+        st.error(f"Fejl i billedbehandling: {e}")
+        return img_bytes
+
+# PowerPoint-funktioner (get_placeholder_by_tag, fit_replace_text, replace_image, etc. er uændrede)
+def get_placeholder_by_tag(slide, tag: str):
+    for shape in slide.placeholders:
+        if shape.has_text_frame and shape.text_frame.text.strip().upper() == tag.upper():
+            return shape
+        if tag.upper() in shape.name.upper():
+            return shape
+    for shape in slide.shapes:
+        if shape.has_text_frame and shape.text_frame.text.strip().upper() == tag.upper():
+            return shape
+        if tag.upper() in shape.name.upper():
+            return shape
+    return None
+
+def fit_replace_text(shape, value: str):
+    value_str = str(value).strip() if value is not None and pd.notna(value) else ""
+    if not shape.has_text_frame:
+        return
+    text_frame = shape.text_frame
+    if not text_frame.paragraphs:
+        p = text_frame.add_paragraph()
+    else:
+        p = text_frame.paragraphs[0]
+    if not p.runs:
+        p.add_run()
+    template_run = p.runs[0]
+    font_name = template_run.font.name
+    font_size = template_run.font.size
+    font_bold = template_run.font.bold
+    while len(text_frame.paragraphs) > 0:
+        p_to_remove = text_frame.paragraphs[0]
+        for run in p_to_remove.runs:
+            run.text = ""
+    p = text_frame.paragraphs[0]
+    p.clear() 
+    run = p.add_run()
+    run.text = value_str
+    run.font.name = font_name
+    run.font.size = font_size
+    run.font.bold = font_bold
+    text_frame.word_wrap = True
+
+def replace_image(slide, placeholder_tag: str, image_bytes: bytes, crop_to_frame: bool = False):
+    # ... (Uændret)
+    placeholder = get_placeholder_by_tag(slide, placeholder_tag)
+    if placeholder is None:
+        return
+        
+    left, top, width, height = placeholder.left, placeholder.top, placeholder.width, placeholder.height
+    
+    try:
+        image_stream = io.BytesIO(image_bytes)
+        pic = slide.shapes.add_picture(image_stream, left, top, width, height)
+        
+        sp = placeholder.element
+        sp.getparent().remove(sp)
+        
+        image_stream.seek(0)
+        pic = slide.shapes.add_picture(image_stream, left, top, width, height)
+
+        img = Image.open(io.BytesIO(image_bytes))
+        img_w, img_h = img.size
+        
+        frame_w, frame_h = width.emu, height.emu
+        
+        w_ratio = frame_w / img_w
+        h_ratio = frame_h / img_h
+        
+        scale = max(w_ratio, h_ratio) if crop_to_frame else min(w_ratio, h_ratio)
+
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+
+        pic.width = new_w
+        pic.height = new_h
+        pic.left = left + (width - pic.width) // 2
+        pic.top = top + (height - pic.height) // 2
+
+        if crop_to_frame:
+            offset_x = (new_w - frame_w) / (2 * new_w) 
+            offset_y = (new_h - frame_h) / (2 * new_h) 
+
+            pic.crop_left = offset_x
+            pic.crop_right = offset_x
+            pic.crop_top = offset_y
+            pic.crop_bottom = offset_y
+            
+            pic.left = left
+            pic.top = top
+            pic.width = width
+            pic.height = height
+
+    except Exception as e:
+        st.warning(f"Advarsel: Kunne ikke indsætte billede for placeholder '{placeholder_tag}'. Fejl: {e}")
+
+def find_first_slide_with_tag(prs: Presentation, tag: str) -> Tuple[Presentation.slide, int]:
+    # ... (Uændret)
+    for i, slide in enumerate(prs.slides):
+        for shape in slide.shapes:
+            if shape.has_text_frame and shape.text_frame.text.strip().upper() == tag.upper():
+                return slide, i
+    st.error(f"Fejl: Skabelonen ('input-template.pptx') mangler en slide med placeholder-tekst: {tag}")
+    raise ValueError("Placeholder ikke fundet i skabelonen.")
+
+def get_slide_index_by_tag(prs: Presentation, tag: str) -> int:
+    # ... (Uændret)
+    for i, slide in enumerate(prs.slides):
+        for shape in slide.shapes:
+            if shape.has_text_frame and shape.text_frame.text.strip().upper() == tag.upper():
+                return i
+    return -1
+
+def fill_overview_slides(prs: Presentation, all_renderings: List[bytes]):
+    # ... (Uændret)
+    if not all_renderings:
+        return 0
+        
+    overview_slide, overview_index = find_first_slide_with_tag(prs, 'OVERVIEW')
+    overview_layout = overview_slide.slide_layout
+    
+    num_renderings = len(all_renderings)
+    num_overview_slides = (num_renderings + 11) // 12
+    slides_created = 0
+
+    for i in range(num_overview_slides):
+        current_slide = prs.slides.add_slide(overview_layout)
+        slides_created += 1
+        
+        start_index = i * 12
+        end_index = min((i + 1) * 12, num_renderings)
+        
+        for j, render_bytes in enumerate(all_renderings[start_index:end_index]):
+            placeholder_tag = OVERVIEW_RENDER_PLACEHOLDERS[j]
+            replace_image(current_slide, placeholder_tag, render_bytes, crop_to_frame=True)
+            
+        if num_overview_slides > 1:
+            title_shape = get_placeholder_by_tag(current_slide, 'OVERVIEW')
+            if title_shape:
+                 fit_replace_text(title_shape, f"OVERVIEW (SIDE {i+1} AF {num_overview_slides})")
+
+
+    prs.slides._sldIdLst.remove(prs.slides._sldIdLst[overview_index])
+    
+    return slides_created
+
+def fill_setting_slides(prs: Presentation, setting_data: List[Dict[str, Any]], library_df: pd.DataFrame, master_df: pd.DataFrame) -> int:
+    """
+    Opretter setting-slides for alle settings og håndterer pagination af produkter.
+    """
+    
+    if not setting_data:
+        return 0
+        
+    setting_template_slide, template_index = find_first_slide_with_tag(prs, '{{SETTINGNAME}}')
+    setting_layout = setting_template_slide.slide_layout
+    
+    total_slides_created = 0
+    
+    for setting in setting_data:
+        setting_name = setting['name']
+        
+        # 1. Generér data
+        pcon_df = load_pcon_file(setting['pcon_file'])
+        # OPKALD OPdateret med master_df
+        product_list_text, product_details, warnings = build_products_list(pcon_df, library_df, master_df) 
+        
+        for warning in warnings:
+            st.warning(f"[{setting_name}] {warning}")
+        
+        num_products = len(product_details)
+        num_product_slides = (num_products + 11) // 12
+        
+        # 2. Opret og udfyld de(n) primære slide(r)
+        
+        for i in range(num_product_slides):
+            is_first_slide = (i == 0)
+            
+            current_slide = prs.slides.add_slide(setting_layout)
+            total_slides_created += 1
+            
+            # --- Udfyld faste tekst-placeholders ---
+            fit_replace_text(get_placeholder_by_tag(current_slide, '{{SETTINGNAME}}'), setting_name)
+            
+            if is_first_slide:
+                fit_replace_text(get_placeholder_by_tag(current_slide, '{{SETTINGSUBHEADLINE}}'), setting['subheadline'])
+                fit_replace_text(get_placeholder_by_tag(current_slide, '{{SettingDimensions}}'), setting['dimensions'])
+                fit_replace_text(get_placeholder_by_tag(current_slide, '{{SettingSize}}'), setting['size'])
+                fit_replace_text(get_placeholder_by_tag(current_slide, '{{ProductsinSettingList}}'), product_list_text)
+
+                # --- Indsæt billeder (Rendering, Linedrawing) ---
+                replace_image(current_slide, '{{Rendering}}', preprocess_image(setting['rendering_bytes']))
+                
+                if setting['linedrawing_bytes']:
+                    replace_image(current_slide, '{{Linedrawing}}', preprocess_image(setting['linedrawing_bytes']))
+                
+                # Accessories: Fjernet fra input, så tekst/billed-placeholders gøres tomme
+                for k in range(6):
+                    placeholder_tag = ACCESSORY_PLACEHOLDERS[k]
+                    fit_replace_text(get_placeholder_by_tag(current_slide, placeholder_tag), "")
+            else:
+                 # Ryd felter på efterfølgende slides
+                fit_replace_text(get_placeholder_by_tag(current_slide, '{{SETTINGSUBHEADLINE}}'), "")
+                fit_replace_text(get_placeholder_by_tag(current_slide, '{{ProductsinSettingList}}'), "")
+            
+            # --- Udfyld produkt- og packshot-placeholders ---
+            start_prod_index = i * 12
+            end_prod_index = min((i + 1) * 12, num_products)
+            
+            for j, product_detail in enumerate(product_details[start_prod_index:end_prod_index]):
+                prod_index = j
+                
+                # 1. Produktbeskrivelse
+                prod_desc_tag = PRODUCT_PLACEHOLDERS[prod_index]
+                fit_replace_text(get_placeholder_by_tag(current_slide, prod_desc_tag), product_detail['description'])
+                
+                # 2. Packshot
+                packshot_tag = PACKSHOT_PLACEHOLDERS[prod_index]
+                packshot_url = product_detail.get('packshot_url')
+
+                if packshot_url:
+                    # NYT: Hent billed-bytes fra URL og forbehandl
+                    packshot_bytes = fetch_image_bytes_from_url(packshot_url, product_detail['article_no'])
+                    
+                    if packshot_bytes:
+                         replace_image(current_slide, packshot_tag, preprocess_image(packshot_bytes))
+                
+            # Opdater sidens titel for pagination
+            if num_product_slides > 1:
+                fit_replace_text(get_placeholder_by_tag(current_slide, '{{SETTINGNAME}}'), f"{setting_name} (Produkter: Side {i+1} af {num_product_slides})")
+
+
+    prs.slides._sldIdLst.remove(prs.slides._sldIdLst[template_index])
+    
+    return total_slides_created
+
+def export_pptx(prs: Presentation) -> bytes:
+    # ... (Uændret)
+    with io.BytesIO() as buffer:
+        prs.save(buffer)
+        return buffer.getvalue()
 
 def group_uploaded_files(uploaded_files: List[io.BytesIO]) -> Dict[str, Dict[str, Any]]:
-    """
-    Grupperer filer i settings baseret på det fælles filnavn.
-
-    Filnavne forventes at være i format: "UniktNavn_Detalje.ext".
-    Det unikke navn (første segment) bruges til at gruppere.
-    """
+    # ... (Uændret)
     settings_grouped = defaultdict(lambda: {'csv': None, 'rendering': None, 'floorplan': None, 'name': None})
     
     for file in uploaded_files:
         filename = file.name
         
-        # Forsøg at finde det fælles navn (første segment, fx "OsloLivingRoom")
-        # Vi splitter ved den første understregning eller bindestreg som en robust separator
         base_name = re.split(r'[_-]', filename, 1)[0].strip() 
         
         if not base_name:
-            continue # Ignorer filer uden et genkendeligt navn
+            continue
             
-        # Standardiser navnet (første bogstav stort, resten småt for placeholders)
         setting_name_standardized = base_name.replace('_', ' ').strip().title()
         
-        # Tildel filen til den korrekte type
         settings_grouped[base_name]['name'] = setting_name_standardized
 
         filename_lower = filename.lower()
@@ -113,31 +487,28 @@ def group_uploaded_files(uploaded_files: List[io.BytesIO]) -> Dict[str, Dict[str
         elif 'floorplan' in filename_lower:
             settings_grouped[base_name]['floorplan'] = file
         elif filename_lower.endswith('.jpg') or filename_lower.endswith('.jpeg') or filename_lower.endswith('.png'):
-            # Antager at en resterende JPG/PNG er renderingen
             settings_grouped[base_name]['rendering'] = file
             
-    # Konverter defaultdict til en almindelig dict for at bevare de indlæste navne
     final_settings = {}
     for base_name, data in settings_grouped.items():
         if data['csv'] and data['rendering']:
             final_settings[base_name] = data
         else:
-            # Fejlfinding: En setting mangler den obligatoriske CSV eller Rendering
             st.warning(f"⚠️ Setting '{data['name']}' blev ignoreret: Mangler CSV ({'OK' if data['csv'] else 'Mangler'}) eller Rendering ({'OK' if data['rendering'] else 'Mangler'}).")
 
     return final_settings
+
 
 # --- HOVEDLOGIK (Opdateret UI) ---
 
 def main():
     st.set_page_config(page_title="PowerPoint Generator", layout="wide")
-    st.title("📄 Muuto PowerPoint Generator (Automatisk)")
+    st.title("📄 Muuto PowerPoint Generator")
     st.markdown("---")
 
     # --- Sektion: 1. Opslagsfiler og Skabelon ---
     st.header("1. Opslagsfiler (Google Sheets) og Skabelon")
     
-    # Standard URL'er (Brugere kan redigere dem, men de er forudfyldt)
     LIBRARY_DEFAULT_URL = "https://docs.google.com/spreadsheets/d/1h3yaq094mBa5Yadfi9Nb_Wrnzj3gIH2DviIfU0DdwsQ/export?format=csv&gid=437866492"
     MASTER_DEFAULT_URL = "https://docs.google.com/spreadsheets/d/1blj42SbFpszWGyOrDOUwyPDJr9K1NGpTMX6eZTbt_P4/export?format=csv&gid=194572316"
 
@@ -151,31 +522,40 @@ def main():
         )
     with col_master:
         master_url = st.text_input(
-            "URL til **Muuto Master Data**", 
+            "URL til **Muuto Master Data** (Bruges nu også til Packshots)", 
             key="master_url", 
             value=MASTER_DEFAULT_URL
         )
     with col_template:
+        st.write("Upload **input-template.pptx** (Kræves)")
         template_file = st.file_uploader(
-            "Upload **input-template.pptx** (Kræves)", 
+            "input-template.pptx", 
             type=['pptx'], 
-            key="template_upload"
+            key="template_upload",
+            label_visibility="collapsed"
         )
+        if template_file:
+            st.success("Skabelon uploadet.")
         
     st.markdown("---")
     
-    # --- Sektion: 2. Upload Alle Setting Filer (NYT) ---
+    # --- Sektion: 2. Upload Alle Setting Filer ---
     st.header("2. Upload Alle Setting Filer")
     st.warning("Upload alle filer (CSV/XLSX, Rendering.jpg, Floorplan.jpg) på én gang. Filerne skal have et **fælles prefix** for at blive grupperet (fx 'OsloRoom_PCon.csv', 'OsloRoom_Render.jpg', 'OsloRoom_Floorplan.jpg').")
 
+    st.write("Multi-upload: CSV/XLSX, Rendering JPG/PNG, Floorplan JPG/PNG")
     all_setting_files = st.file_uploader(
-        "Multi-upload: CSV/XLSX, Rendering JPG/PNG, Floorplan JPG/PNG", 
+        "Setting Filer", 
         type=['csv', 'xlsx', 'jpg', 'jpeg', 'png'], 
         accept_multiple_files=True,
-        key="all_setting_files_upload"
+        key="all_setting_files_upload",
+        label_visibility="collapsed"
     )
     
-    # Valgfri manuelle inputs (da de ikke er tilgængelige i filnavnet)
+    if all_setting_files:
+        st.success(f"{len(all_setting_files)} filer er uploadet og klar til gruppering.")
+
+    # Valgfri manuelle inputs (gælder for *Alle* settings)
     st.subheader("Manuelle Inputs (Gælder for *Alle* settings)")
     
     col_sub, col_dim, col_size = st.columns(3)
@@ -201,50 +581,47 @@ def main():
             errors.append("❌ URL til Library eller Master Data mangler.")
             
         if not all_setting_files:
-            errors.append("❌ Der er ikke uploadet nogen filer til settings.")
+            st.warning("⚠️ Der er ikke uploadet nogen filer til settings. Præsentationen kan blive tom.")
         
         if errors:
             for error in errors:
                 st.error(error)
             st.stop()
             
-        # Gruppér filer automatisk (Returns Dict[base_name, Dict[file_type, file_object]])
         grouped_settings = group_uploaded_files(all_setting_files)
         
-        if not grouped_settings:
-            st.error("❌ Ingen gyldige settings at behandle. Tjek, at du har mindst én CSV/XLSX og én Rendering (.jpg/.png) med et fælles navn.")
-            st.stop()
+        if not grouped_settings and all_setting_files:
+             st.error("❌ Ingen gyldige settings kunne dannes fra de uploadede filer. Tjek filnavnekonventionen.")
+             st.stop()
 
-        # Konverter til den gamle list-struktur for at genbruge fill-funktionerne
         valid_setting_data_for_processing = []
         all_renderings_bytes = []
         
         for base_name, data in grouped_settings.items():
             
-            # Læs alle bytes i hukommelsen
             rendering_bytes = data['rendering'].read()
             all_renderings_bytes.append(rendering_bytes)
             
             linedrawing_bytes = data['floorplan'].read() if data['floorplan'] else None
             
             setting = {
-                'name': data['name'], # Navnet hentet fra filnavn
+                'name': data['name'], 
                 'subheadline': manual_subheadline,
                 'dimensions': manual_dimensions,
                 'size': manual_size,
                 'pcon_file': data['csv'],
                 'rendering_bytes': rendering_bytes,
-                'linedrawing_bytes': linedrawing_bytes,
-                'packshot_bytes_list': [], # Tom liste (ingen uploadet)
-                'accessories': [] # Tom liste (ingen uploadet)
+                'linedrawing_bytes': linedrawing_bytes
+                # Packshots/Accessories er fjernet fra denne struktur, da de hentes i fill_setting_slides
             }
             valid_setting_data_for_processing.append(setting)
 
         # --- 2. Databehandling ---
         with st.spinner("Læser opslagsdata fra Google Sheets og skabelon..."):
             try:
+                # Bemærk: Master data læses før slides for at undgå fejl i slide-funktionen
                 library_df = load_library_data(library_url, ['PRODUCT', 'EUR ITEM NO.'], 'Library_data')
-                master_df = load_library_data(master_url, ['ITEM NO.'], 'Muuto Master Data') 
+                master_df = load_library_data(master_url, ['ITEM NO.', 'IMAGE URL'], 'Muuto Master Data') 
                 
                 template_bytes = template_file.read()
                 prs = Presentation(io.BytesIO(template_bytes))
@@ -253,13 +630,10 @@ def main():
                 st.stop()
 
         # --- 3. Udfyld PowerPoint ---
-        with st.spinner("Genererer PowerPoint-slides..."):
+        with st.spinner("Genererer PowerPoint-slides og henter packshots..."):
             
             try:
-                # Udfyld OVERVIEW før settings
                 fill_overview_slides(prs, all_renderings_bytes)
-                
-                # Udfyld settings
                 fill_setting_slides(prs, valid_setting_data_for_processing, library_df, master_df)
                 
             except Exception as e:
