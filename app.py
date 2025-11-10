@@ -270,7 +270,6 @@ def create_simple_template_pptx() -> bytes:
 @st.cache_data
 def load_master() -> pd.DataFrame:
     url = resolve_gsheet_to_csv(MASTER_URL)
-    # BRUGER OPPDATERT GLOBAL TIMEOUT
     r = requests.get(url, timeout=REQUEST_TIMEOUT); r.raise_for_status()
     df = pd.read_csv(io.BytesIO(r.content))
     def norm(s): return re.sub(r"[\s_.-]+","",str(s).strip().lower())
@@ -290,7 +289,6 @@ def load_master() -> pd.DataFrame:
 @st.cache_data
 def load_mapping() -> pd.DataFrame:
     url = resolve_gsheet_to_csv(MAPPING_URL)
-    # BRUGER OPPDATERT GLOBAL TIMEOUT
     r = requests.get(url, timeout=REQUEST_TIMEOUT); r.raise_for_status()
     df = pd.read_csv(io.BytesIO(r.content))
     def norm(s): return re.sub(r"[\s_.-]+","",str(s).strip().lower())
@@ -526,8 +524,8 @@ def build_presentation(master_df: pd.DataFrame,
 
 # --------- UI ---------
 def main():
-    if 'groups_map_state' not in st.session_state:
-        st.session_state.groups_map_state = {}
+    if 'uploaded_file_names' not in st.session_state:
+        st.session_state.uploaded_file_names = []
 
     st.set_page_config(page_title="Muuto PPT Generator", layout="wide")
     st.title("Muuto PPT Generator")
@@ -542,7 +540,7 @@ def main():
     )
     st.markdown("---")
     
-    # --- Template Download Section ---
+    # --- Template Setup Section ---
     st.subheader("Template Setup")
     if not os.path.exists(TEMPLATE_FILE):
         st.warning(f"Template file '{TEMPLATE_FILE}' not found. **Please use the download button below to generate the simple, compatible template.**")
@@ -550,7 +548,6 @@ def main():
         st.success(f"Template file '{TEMPLATE_FILE}' found. Proceed to file upload.")
         
     if st.button("Download Template File (input-template.pptx)"):
-        # We don't need to put this in spinner as it runs outside the main execution block
         template_bytes = create_simple_template_pptx()
         st.download_button(
             "Click to Download Template",
@@ -568,83 +565,21 @@ def main():
         accept_multiple_files=True
     )
     
+    # Update file list state for display
+    if uploads:
+        st.session_state.uploaded_file_names = [f.name for f in uploads]
+    
     # ----------------------------------------------------------------------
-    # 1. Automatic Grouping (Initial Guess) and State Management
+    # Simplified File List Display
     # ----------------------------------------------------------------------
     
-    uploaded_files_data = []
-    if uploads:
-        st.subheader("File Grouping Overview (Manual Adjustment)")
-        st.markdown("If the **Grouping Key** is wrong, please correct it to match the key of the corresponding files (e.g., 'Shop-the-look_2025_Q2 - dining 01').")
+    if st.session_state.uploaded_file_names:
+        st.subheader("Uploaded Files")
+        st.markdown("The following files are ready for processing:")
         
-        # Determine unique IDs of files currently in the uploader
-        current_file_ids = {f.file_id: f for f in uploads}
-
-        # Clear state for files that are no longer uploaded
-        keys_to_delete = [fid for fid in st.session_state.groups_map_state if fid not in current_file_ids]
-        for fid in keys_to_delete:
-            del st.session_state.groups_map_state[fid]
-
-        # Process newly uploaded files
-        for f in uploads:
-            file_id = f.file_id
-            name, _ = os.path.splitext(f.name)
-            
-            # Logic to generate initial grouping key
-            base_name = name
-            lf = f.name.lower()
-            is_line_drawing = any(k in lf for k in ["line","floorplan","drawing"])
-            if is_line_drawing:
-                base_name = re.sub(r"[\s_-]*(line|floorplan|drawing)$", "", base_name, flags=re.I).strip()
-            base_key = base_name.strip()
-            
-            # Initialize or update state
-            if file_id not in st.session_state.groups_map_state:
-                 st.session_state.groups_map_state[file_id] = {"filename": f.name, "current_group_key": base_key}
-            
-            # Gather files for display/processing (using current state key)
-            uploaded_files_data.append({
-                "file_id": file_id,
-                "filename": f.name,
-                "current_group_key": st.session_state.groups_map_state[file_id]["current_group_key"],
-                "file_object": f
-            })
-            
-        
-        # Display table headers
-        col1, col2, col3 = st.columns([1, 2, 4])
-        col1.markdown("**ID**")
-        col2.markdown("**File Name**")
-        col3.markdown("**Grouping Key (Editable)**")
-        
-        # Display interactive rows
-        keys_changed = False
-        for i, item in enumerate(uploaded_files_data):
-            file_id = item['file_id']
-            file_type = item['filename'].split('.')[-1].upper()
-            
-            # Use columns again to align text input
-            col_id, col_name, col_input = st.columns([1, 2, 4])
-            
-            col_id.write(f"`...{file_id[-4:]}`") 
-            col_name.write(f"**`{file_type}`**: {item['filename']}")
-            
-            # Text Input for manual correction
-            new_key = col_input.text_input(
-                label="Grouping Key",
-                value=st.session_state.groups_map_state[file_id]["current_group_key"],
-                key=f"group_key_{file_id}",
-                label_visibility="collapsed"
-            )
-            
-            # Update session state if key was changed
-            if new_key != st.session_state.groups_map_state[file_id]["current_group_key"]:
-                 st.session_state.groups_map_state[file_id]["current_group_key"] = new_key
-                 keys_changed = True
-        
-        # If keys changed during input, rerun to ensure logic is based on final state before execution
-        if keys_changed:
-             st.experimental_rerun()
+        # Display list of uploaded file names
+        for file_name in st.session_state.uploaded_file_names:
+            st.write(f"- {file_name}")
     
     st.markdown("---")
 
@@ -652,40 +587,42 @@ def main():
         if not os.path.exists(TEMPLATE_FILE):
             st.error(f"Template file '{TEMPLATE_FILE}' is missing. Please use the download button above to generate it."); st.stop()
         
-        if not uploaded_files_data:
+        if not uploads:
              st.error("Please upload files first."); st.stop()
-
 
         # USER-FRIENDLY SINGLE SPINNER
         with st.spinner("Processing files and generating presentation... This may take a moment."):
             try:
                 # 1. Load data
-                # Increased timeout handles the ReadTimeout error for Google Sheets
                 master_df  = load_master()
                 mapping_df = load_mapping()
     
-                # 2. Final Grouping based on Session State
+                # 2. Final Grouping (Using Automatic Guess from filenames)
                 final_groups_map: Dict[str, Dict[str, Any]] = {}
                 
-                for item in uploaded_files_data:
-                    current_key = item['current_group_key']
-                    f = item['file_object']
+                for f in uploads:
+                    name, _ = os.path.splitext(f.name)
                     
-                    if current_key not in final_groups_map:
-                         # Use the key to derive the user-friendly setting name
-                         setting_name = current_key.split(" - ", 1)[-1].title().strip()
-                         if setting_name == current_key: setting_name = current_key.title()
-                         final_groups_map[current_key] = {"name": setting_name, "csv": None, "rendering": None, "line": None}
-                         
+                    base_name = name
                     lf = f.name.lower()
+                    is_line_drawing = any(k in lf for k in ["line","floorplan","drawing"])
+                    if is_line_drawing:
+                        base_name = re.sub(r"[\s_-]*(line|floorplan|drawing)$", "", base_name, flags=re.I).strip()
                     
-                    # Prioritize file types based on suffix
+                    base_key = base_name.strip()
+                    
+                    if base_key not in final_groups_map:
+                         setting_name = base_key.split(" - ", 1)[-1].title().strip()
+                         if setting_name == base_key: setting_name = base_key.title()
+                         final_groups_map[base_key] = {"name": setting_name, "csv": None, "rendering": None, "line": None}
+                         
+                    
                     if lf.endswith(".csv"):
-                        final_groups_map[current_key]["csv"] = f
+                        final_groups_map[base_key]["csv"] = f
                     elif any(k in lf for k in ["line","floorplan","drawing"]):
-                        final_groups_map[current_key]["line"] = f
+                        final_groups_map[base_key]["line"] = f
                     elif lf.endswith((".jpg",".jpeg",".png")):
-                        final_groups_map[current_key]["rendering"] = f
+                        final_groups_map[base_key]["rendering"] = f
                 
                 settings, overview_imgs = [], []
                 for key, data in final_groups_map.items():
