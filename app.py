@@ -16,7 +16,7 @@ MAPPING_URL = "https://docs.google.com/spreadsheets/d/1S50it_q1BahpZCPW8dbuN7DyO
 PCON_SKIPROWS = 2
 IDX_SHORT, IDX_VARIANT, IDX_ARTICLE, IDX_QTY = 2, 4, 17, 30
 
-# Template tags (kan stå med/uden mellemrum i filen)
+# Template tags
 TAG_SETTINGNAME   = "{{SETTINGNAME}}"
 TAG_PRODUCTS_LIST = "{{ProductsinSettingList}}"
 TAG_RENDERING     = "{{Rendering}}"
@@ -37,13 +37,10 @@ def resolve_gsheet_to_csv(url: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{sheet}/export?format=csv&gid={gid}"
 
 def _norm_placeholder_text(s: str) -> str:
-    # Fjern whitespace direkte efter '{{' og før '}}' og lav lower
     if s is None: return ""
     s = str(s)
-    # collaps spaces inside braces: "{{ SettingNAME }}" -> "{{SETTINGNAME}}"
     s = re.sub(r"\{\{\s*", "{{", s)
     s = re.sub(r"\s*\}\}", "}}", s)
-    # remove all internal spaces between braces
     s = re.sub(r"\{\{(\s*)([^}]*?)(\s*)\}\}", lambda m: "{{" + re.sub(r"\s+", "", m.group(2)) + "}}", s)
     return s.lower()
 
@@ -57,7 +54,6 @@ def find_shape_by_placeholder(slide, tag: str):
             txt = shp.text_frame.text or ""
             if _norm_placeholder_text(txt) == want or want in _norm_placeholder_text(txt):
                 return shp
-    # fallback: søg i placeholders-collection
     for shp in getattr(slide, "placeholders", []):
         if getattr(shp, "has_text_frame", False) and shp.text_frame:
             txt = shp.text_frame.text or ""
@@ -66,17 +62,27 @@ def find_shape_by_placeholder(slide, tag: str):
     return None
 
 def set_text_preserve_style(shape, text: str):
-    if not shape or not shape.has_text_frame: return
+    """Expect a shape with text_frame. Preserves first run style if present."""
+    if not shape or not getattr(shape, "has_text_frame", False):
+        return
     tf = shape.text_frame
+    # capture style from first run if exists
     font_name = font_size = font_bold = None
     if tf.paragraphs and tf.paragraphs[0].runs:
         r0 = tf.paragraphs[0].runs[0]
         font_name, font_size, font_bold = r0.font.name, r0.font.size, r0.font.bold
-    for p in list(tf.paragraphs):
-        for r in list(p.runs): r.text = ""
-    p = tf.paragraphs[0] if tf.paragraphs else tf.add_paragraph()
-    p.clear()
-    run = p.add_run(); run.text = text or ""
+    # clear all paragraphs and rebuild one run
+    while tf.paragraphs:
+        p = tf.paragraphs[0]
+        for r in list(p.runs):
+            r.text = ""
+        try:
+            tf._element.remove(p._p)
+        except Exception:
+            break
+    p = tf.add_paragraph()
+    run = p.add_run()
+    run.text = text or ""
     if font_name: run.font.name = font_name
     if font_size: run.font.size = font_size
     if font_bold is not None: run.font.bold = font_bold
@@ -93,11 +99,9 @@ def replace_image_by_tag(slide, tag: str, img_bytes: bytes):
 
 def duplicate_slide(prs: Presentation, slide):
     new_slide = prs.slides.add_slide(slide.slide_layout)
-    # Fjern layoutens default shapes
     for shp in list(new_slide.shapes):
         sp = shp.element
         sp.getparent().remove(sp)
-    # Kopiér alle shapes fra kildeslide
     for shp in slide.shapes:
         new_slide.shapes._spTree.append(deepcopy(shp._element))
     return new_slide
@@ -232,7 +236,7 @@ def preprocess(img: bytes, max_side=1400, quality=85) -> bytes:
         if max(im.size) > max_side:
             ratio = min(max_side/im.width, max_side/im.height)
             im = im.resize((int(im.width*ratio), int(im.height*ratio)), Image.Resampling.LANCZOS)
-        buf = io.BytesIO(); im.save(buf, format="JPEG", quality=quality); return buf.getvalue()
+        buf = io.BytesIO(); im.save(buf, format="JPEG", quality=85); return buf.getvalue()
     except Exception:
         return img
 
@@ -254,10 +258,10 @@ def blank_layout(prs: Presentation):
 
 def add_products_table_on_blank(prs: Presentation, title: str, rows: List[List[str]]):
     s = prs.slides.add_slide(blank_layout(prs))  # altid blank side
-    # Titel-boks
+    # Titel-boks som rigtig shape (ikke paragraph)
     left, top, width, height = Inches(0.6), Inches(0.3), Inches(9.2), Inches(0.6)
-    tx = s.shapes.add_textbox(left, top, width, height)
-    set_text_preserve_style(tx.text_frame.paragraphs[0] if tx.text_frame.paragraphs else tx, title)
+    tx_shape = s.shapes.add_textbox(left, top, width, height)
+    set_text_preserve_style(tx_shape, title)
 
     headers = ["Quantity", "Description", "Article No. / New Item No."]
     data = [headers] + rows
@@ -290,21 +294,20 @@ def build_presentation(master_df: pd.DataFrame,
                 replace_image_by_tag(s, OVERVIEW_TAGS[i], preprocess(rb))
         else:
             s = prs.slides.add_slide(blank_layout(prs))
-            tb = s.shapes.add_textbox(Inches(0.6), Inches(0.3), Inches(9), Inches(0.6))
-            set_text_preserve_style(tb, OVERVIEW_TITLE)
+            tx = s.shapes.add_textbox(Inches(0.6), Inches(0.3), Inches(9), Inches(0.6))
+            set_text_preserve_style(tx, OVERVIEW_TITLE)
             cols, rows = 4, 3
             cell_w, cell_h = Inches(2.2), Inches(2.0)
             x0, y0 = Inches(0.5), Inches(1.2)
             for i, rb in enumerate(overview_renderings[:12]):
-                c, r = i % cols, i // cols
                 s.shapes.add_picture(io.BytesIO(preprocess(rb)),
-                                     x0 + c*cell_w, y0 + r*cell_h, width=cell_w, height=cell_h)
+                                     x0 + (i % cols)*cell_w, y0 + (i // cols)*cell_h,
+                                     width=cell_w, height=cell_h)
 
     # Settings
     for gi, g in enumerate(groups, 1):
         if status: status.write(f"5️⃣ Opretter setting {gi}/{len(groups)}: {g['name']}")
 
-        # Setting-slide
         base = setting_tpl if setting_tpl else prs.slides[0]
         s = duplicate_slide(prs, base)
         set_text_preserve_style(find_shape_by_placeholder(s, TAG_SETTINGNAME), g["name"])
