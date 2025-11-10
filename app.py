@@ -28,7 +28,7 @@ PROD_DESC_TAGS = [f"{{{{PRODUCT DESCRIPTION {i}}}}}" for i in range(1, 13)]
 OVERVIEW_TAGS = [f"{{{{Rendering{i}}}}}" for i in range(1, 13)]
 
 # ----------------------------------------------------------------------
-# --------- Utils (Samlet øverst for at undgå NameError) ---------------
+# --------- Utils ------------------------------------------------------
 # ----------------------------------------------------------------------
 
 def resolve_gsheet_to_csv(url: str) -> str:
@@ -66,7 +66,7 @@ def find_shape_by_placeholder(slide, tag: str):
 
 def set_text_preserve_style(shape, text: str):
     """
-    Indsætter tekst og bevarer stilen (skrifttype, størrelse, fed) fra den første 'run'.
+    Indsætter tekst og bevarer stilen fra den første 'run'.
     Håndterer indlejrede tags (f.eks. {{SETTINGNAME}}) og multiline-input.
     Al tekst konverteres til STORE BOGSTAVER.
     """
@@ -74,44 +74,42 @@ def set_text_preserve_style(shape, text: str):
         return
     tf = shape.text_frame
     
-    text = text.upper()
+    # 1. Bestem endelig tekst (håndterer tag-erstatning og uppercase)
+    final_text_content = text.upper()
     
-    is_setting_name_tag = TAG_SETTINGNAME in tf.text
-    
-    # 1. Capture style
+    current_text_upper = tf.text.upper()
+    if TAG_SETTINGNAME.upper() in current_text_upper:
+        # Hvis det er et indlejret tag, erstat kun tagget
+        final_text_content = current_text_upper.replace(TAG_SETTINGNAME.upper(), text.upper())
+
+    # 2. Fang stilen
     font_name = font_size = font_bold = None
     if tf.paragraphs and tf.paragraphs[0].runs:
         r0 = tf.paragraphs[0].runs[0]
         font_name, font_size, font_bold = r0.font.name, r0.font.size, r0.font.bold
         
-    # 2. Forbered ny tekst og linjeseparation
-    lines = text.split('\n')
-    
-    # 3. Håndter indlejret tag-erstatning
-    if is_setting_name_tag:
-        new_text = tf.text.upper().replace(TAG_SETTINGNAME.upper(), text)
-        lines = [new_text]
-    
-    # 4. Ryd eksisterende indhold
-    while len(tf.paragraphs) > 1:
-        tf._element.remove(tf.paragraphs[-1]._p)
-    if tf.paragraphs:
-        p0 = tf.paragraphs[0]
-        for r in list(p0.runs): r.text = ""
-        while len(tf.paragraphs) > 1:
-            try: tf._element.remove(tf.paragraphs[1]._p)
-            except Exception: pass
+    # 3. Ryd eksisterende indhold
+    # Sørg for at den første paragraf fjernes sidst, hvis vi genbruger den
+    while tf.paragraphs:
+        p = tf.paragraphs[0]
+        for r in list(p.runs): r.text = ""
+        try: tf._element.remove(p._p)
+        except Exception: break
             
-    # 5. Indsæt nyt indhold (håndterer multiline)
-    p = tf.paragraphs[0]
-    p.text = "" 
+    # 4. Genopbyg indhold linje for linje
+    lines = final_text_content.split('\n')
     
+    # Skab en ny paragraf til indsættelse (da vi fjernede den første i loopet)
+    p = tf.add_paragraph() 
+    
+    # Vi bruger kun den første linie i `lines` til den paragraf, vi netop har oprettet (p)
+    # og opretter nye paragraffer for de resterende linjer (hvis det er en produktliste)
     for i, line in enumerate(lines):
         if i > 0:
-            p = tf.add_paragraph() 
-            
+            p = tf.add_paragraph()
+        
         run = p.add_run()
-        run.text = line
+        run.text = line.strip()
         if font_name: run.font.name = font_name
         if font_size: run.font.size = font_size
         if font_bold is not None: run.font.bold = font_bold
@@ -184,7 +182,7 @@ def find_first_slide_with_tag(prs: Presentation, tag: str) -> Tuple[Any, int]:
 
 
 # ----------------------------------------------------------------------
-# --------- Data-loaders -----------------------------------------------
+# --------- Data-loaders & Lookups (Med alle de tidligere rettelser) ----
 # ----------------------------------------------------------------------
 
 @st.cache_data
@@ -230,7 +228,6 @@ def load_mapping() -> pd.DataFrame:
     for c in out.columns: out[c] = out[c].astype(str).str.strip()
     return out
 
-# --------- Robust pCon CSV ---------
 def _try_read_csv(fileobj, **kwargs):
     fileobj.seek(0)
     return pd.read_csv(fileobj, **kwargs)
@@ -272,7 +269,6 @@ def pcon_from_csv(uploaded_file) -> pd.DataFrame:
         raise ValueError("pCon CSV blev læst, men indeholdt ingen gyldige rækker med ARTICLE_NO.")
     return sub
 
-# --------- Lookups ---------
 def fallback_key(article: str) -> str:
     base = re.sub(r"^SPECIAL-", "", str(article), flags=re.I)
     return base.split("-")[0].strip()
@@ -298,33 +294,50 @@ def mapping_description(map_df: pd.DataFrame, article: str) -> str:
     hit = map_df.loc[map_df["OLD Item-variant"].apply(fallback_key) == base, "Description"]
     return str(hit.iloc[0]) if not hit.empty else ""
 
-# --------- Billeder ---------
+# --------- Billeder (Med robust fetching) ---------
 @st.cache_data(ttl=3600)
 def fetch_image(url: str) -> bytes | None:
     if not url or not url.startswith("http"): return None
     try:
-        r = requests.get(url, timeout=15); r.raise_for_status()
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
         
         content_type = r.headers.get("Content-Type","").lower()
         if content_type.startswith("text/") and "image" not in content_type:
              return None
              
         return r.content
-    except requests.RequestException:
+    except requests.exceptions.RequestException:
+        # Returnerer None ved netværksfejl (404, 500, timeout)
         return None
 
 def preprocess(img: bytes, max_side=1400, quality=85) -> bytes:
     try:
         im = Image.open(io.BytesIO(img))
-        if im.mode != "RGB": im = im.convert("RGB")
+        # Konverter til RGB for at undgå problemer med pptx og PIL
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGB")
+            
         if max(im.size) > max_side:
             ratio = min(max_side/im.width, max_side/im.height)
             im = im.resize((int(im.width*ratio), int(im.height*ratio)), Image.Resampling.LANCZOS)
-        buf = io.BytesIO(); im.save(buf, format="JPEG", quality=85); return buf.getvalue()
+            
+        buf = io.BytesIO()
+        # Brug JPEG og optimering (ligner din gamle kode)
+        im.save(buf, format="JPEG", quality=quality, optimize=True) 
+        buf.seek(0)
+        return buf.getvalue()
     except Exception:
-        return img
+        # Hvis preprocess fejler, returner de originale bytes for at give pptx en chance
+        return img 
 
 # --------- PPT-byggesten ---------
+def blank_layout(prs: Presentation):
+    for ly in prs.slide_layouts:
+        if ly.name and "blank" in ly.name.lower():
+            return ly
+    return prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[1]
+
 def create_product_list_text(items: List[Dict[str, Any]]) -> str:
     """Genererer en multiline streng af produktlister i det ønskede format."""
     lines = []
@@ -347,10 +360,7 @@ def create_product_list_text(items: List[Dict[str, Any]]) -> str:
 def build_presentation(master_df: pd.DataFrame,
                        mapping_df: pd.DataFrame,
                        groups: List[Dict[str, Any]],
-                       overview_renderings: List[bytes],
-                       status=None) -> bytes:
-    
-    # status-argumentet ignoreres i denne version, da vi bruger en samlet spinner i main()
+                       overview_renderings: List[bytes]) -> bytes:
 
     prs = Presentation(TEMPLATE_FILE)
 
@@ -385,6 +395,7 @@ def build_presentation(master_df: pd.DataFrame,
         # A. Udfyld SETTINGNAME (inkl. "SHOP THE LOOK - {{SETTINGNAME}}")
         setting_title_shape = find_shape_by_placeholder(s, TAG_SETTINGNAME)
         if setting_title_shape:
+            # set_text_preserve_style er opdateret til at håndtere korrekt erstatning og uppercase
             set_text_preserve_style(setting_title_shape, g["name"]) 
 
         # B. Rendering, Linedrawing, Packshots, Product Descriptions
@@ -393,22 +404,24 @@ def build_presentation(master_df: pd.DataFrame,
         if g.get("linedrawing_bytes"):
             replace_image_by_tag(s, TAG_LINEDRAWING, preprocess(g["linedrawing_bytes"]))
 
-        replaced_desc = 0
         for idx, it in enumerate(g["items"][:12]):
+            # Indsættelse af packshot med robust fetching
             if it.get("packshot_url"):
                 raw = fetch_image(it["packshot_url"])
                 if raw:
                     replace_image_by_tag(s, PACKSHOT_TAGS[idx], preprocess(raw))
+                    
+            # Indsættelse af produktbeskrivelse
             desc_tag_shape = find_shape_by_placeholder(s, PROD_DESC_TAGS[idx])
             if desc_tag_shape:
                 set_text_preserve_style(desc_tag_shape, it.get("desc_text",""))
-                replaced_desc += 1
 
         # C. Produktoversigt som formateret tekst i {{ProductsinSettingList}}
         product_list_text = create_product_list_text(g["items"])
         list_shape = find_shape_by_placeholder(s, TAG_PRODUCTS_LIST)
         
         if list_shape:
+            # set_text_preserve_style er opdateret til at håndtere multiline tekst og uppercase
             set_text_preserve_style(list_shape, product_list_text)
 
     # 4. FJERN DE ORIGINALE TEMPLATE SLIDES
