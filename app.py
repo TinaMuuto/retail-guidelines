@@ -13,469 +13,675 @@ from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, PP_PLACEHOLDER
 
-# --- CONSTANTS ---
-OUTPUT_NAME = "Muuto_Settings_Generated.pptx"
+# ---------------------- Constants ----------------------
 TEMPLATE_PATH = Path("input-template.pptx")
-
 # NYE URLs afledt af bruger input. Disse SKAL være offentligt delte (Anyone with the link)!
 # Master Data URL (tidligere 1blj42SbFpszWGyOrDOUwyPDJr9K1NGpTMX6eZTbt_P4)
 DEFAULT_MASTER_URL = "https://docs.google.com/spreadsheets/d/1blj42SbFpszWGyOrDOUwyPDJr9K1NGpTMX6eZTbt_P4/pub?output=csv&gid=1152340088"
 # Mapping Data URL (tidligere 1S50it_q1BahpZCPW8dbuN7DyOMnyDgFIg76xIDSoXEk)
 DEFAULT_MAPPING_URL = "https://docs.google.com/spreadsheets/d/1S50it_q1BahpZCPW8dbuN7DyOMnyDgFIg76xIDSoXEk/pub?output=csv&gid=1056617222"
 
+OUTPUT_NAME = "Muuto_Settings_Generated.pptx"
 
-# Caching for dataframes and images
-@st.cache_data(ttl=3600)
-def http_get_bytes(url: str, timeout: int = 15) -> Optional[io.BytesIO]:
-    """Henter indhold fra URL som bytes (bruges til CSV og billeder)."""
-    try:
-        response = requests.get(url, timeout=timeout)
-        response.raise_for_status()
-        return io.BytesIO(response.content)
-    except requests.exceptions.RequestException as e:
-        st.error(f"HTTP GET fejlede for {url}: {e}")
-        return None
+MAX_OVERVIEW_IMAGES = 12
+HTTP_TIMEOUT = 10
+HTTP_RETRIES = 1
+MAX_IMAGE_PX = 1400
+JPEG_QUALITY = 85
 
-def parse_csv_flex(csv_bytes: io.BytesIO) -> pd.DataFrame:
-    """Læser CSV bytes fleksibelt og håndterer forskellige separators."""
-    # Prøver med standard separatorer: ';' (europeisk), ',' (US/UK) og '\t' (tab)
-    separators = [';', ',', '\t']
-    for sep in separators:
+# ---------------------- Utils - Naming & Data Lookup ----------------------
+
+def clean_name(name: str) -> str:
+    """Cleans shape names for code matching (removes braces, whitespace, and lowercases)."""
+    if name is None:
+        return ""
+    name = name.strip()
+    name = re.sub(r"^\{\{|\}\}$", "", name).strip()
+    return re.sub(r"\s+", "", name).lower()
+
+def normalize_key(key):
+    """Normalizes an article key for robust comparison (trim, uppercase, remove SPECIAL- prefix)."""
+    if isinstance(key, str):
+        return key.strip().upper().replace('SPECIAL-', '')
+    return str(key).strip().upper().replace('SPECIAL-', '')
+
+def get_base_article_no(article_no):
+    """Gets the base article number (everything before the first dash, removes SPECIAL- prefix)."""
+    article_no = normalize_key(article_no)
+    if '-' in article_no:
+        return article_no.split('-')[0].strip()
+    return article_no.strip()
+
+def build_shape_map(slide) -> Dict[str, list]:
+    """Creates a dictionary mapping cleaned shape names to shapes."""
+    mapping: Dict[str, List] = {}
+    for shape in slide.shapes:
         try:
-            csv_bytes.seek(0)
-            df = pd.read_csv(csv_bytes, sep=sep, encoding='utf-8', on_bad_lines='skip', skipinitialspace=True)
-            if not df.empty and df.shape[1] > 1: # Tjekker om DF ikke er tom og har mere end én kolonne
-                return df
+            nm = clean_name(getattr(shape, "name", ""))
+            if nm:
+                mapping.setdefault(nm, []).append(shape)
+        except Exception:
+            continue
+    return mapping
+
+def safe_find_shape(shape_map: Dict[str, list], key: str, index: int = 0) -> Optional[object]:
+    """Helper function to safely find a shape by its cleaned name, with flexibility."""
+    clean_key = clean_name(key)
+    
+    if clean_key in shape_map and len(shape_map[clean_key]) > index:
+        return shape_map[clean_key][index]
+    
+    # Template Flexibility Check: Compensates for common typos or simplifications
+    if clean_key.startswith("productpackshot"):
+        alt_key = clean_key.replace("productpackshot", "packshot")
+        if alt_key in shape_map and len(shape_map[alt_key]) > index:
+            return shape_map[alt_key][index]
+    
+    # Template Flexibility Check: Compensates for known Linedrawing typo
+    if clean_key == "linedrawing":
+        alt_key = "llinedrawing"
+        if alt_key in shape_map and len(shape_map[alt_key]) > index:
+            return shape_map[alt_key][index]
+
+    return None
+
+# --- Utils - Network & Data Loading ---
+
+def http_get_bytes(url: str) -> Optional[bytes]:
+    """Fetches the content of a URL with retries and a timeout."""
+    if not url:
+        return None
+    for attempt in range(HTTP_RETRIES + 1):
+        try:
+            resp = requests.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
+            if resp.status_code == 200 and resp.content:
+                return resp.content
         except Exception:
             pass
-    
-    # Sidste forsøg med Latin-1, hvis UTF-8 fejlede
-    for sep in separators:
+        time.sleep(0.2 * attempt)
+    return None
+
+def parse_csv_flex(buf: bytes) -> pd.DataFrame:
+    """Attempts to parse CSV data with different separators and encodings."""
+    if buf is None:
+        return pd.DataFrame()
+    candidates = [
+        {"sep": ";", "encoding": "utf-8-sig"}, 
+        {"sep": ",", "encoding": "utf-8"},      
+        {"sep": ";", "encoding": "utf-8"},
+        {"sep": "\t", "encoding": "utf-8"},
+        {"sep": ",", "encoding": "utf-8-sig"},
+        {"sep": ";", "encoding": "latin-1"},
+    ]
+    for c in candidates:
         try:
-            csv_bytes.seek(0)
-            df = pd.read_csv(csv_bytes, sep=sep, encoding='latin-1', on_bad_lines='skip', skipinitialspace=True)
-            if not df.empty and df.shape[1] > 1:
-                return df
+            return pd.read_csv(io.BytesIO(buf), sep=c["sep"], encoding=c["encoding"], skipinitialspace=True)
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+def load_remote_csv(url: str) -> pd.DataFrame:
+    """Fetches and normalizes CSV from a remote URL."""
+    content = http_get_bytes(url)
+    if content is None:
+        return pd.DataFrame()
+    df = parse_csv_flex(content)
+    return df
+
+# --- Utils - Data Normalization (Master/Mapping/PCon) ---
+
+def normalize_master(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalizes Master Data (Packshot URLs)."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ITEM NO.", "IMAGE"])
+    
+    cols = {c: c.strip() for c in df.columns}
+    df = df.rename(columns=cols)
+    
+    # Search priority: IMAGE DOWNLOAD LINK > IMAGE URL > generic match
+    col_img = next((c for c in df.columns if c.upper() == "IMAGE DOWNLOAD LINK" or c.upper() == "IMAGE URL" or ("image" in c.lower() and ("url" in c.lower() or "download" in c.lower()))), None)
+    item_col = next((c for c in df.columns if c.strip().upper() == "ITEM NO." or ("item" in c.lower() and "no" in c.lower())), None)
+
+    if item_col is None or col_img is None:
+        return pd.DataFrame(columns=["ITEM NO.", "IMAGE"])
+    
+    out = df[[item_col, col_img]].copy()
+    out.columns = ["ITEM NO.", "IMAGE"]
+    out["ITEM NO."] = out["ITEM NO."].astype(str).str.strip().apply(normalize_key) 
+    out["IMAGE"] = out["IMAGE"].astype(str).str.strip()       
+    return out
+
+def normalize_mapping(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalizes Mapping Data (Descriptions, New Item Nos)."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["OLD Item-variant", "Description", "New Item No."])
+    
+    cols = {c: c.strip() for c in df.columns}
+    df = df.rename(columns=cols)
+    
+    col_old = next((c for c in df.columns if c.lower().strip() in ["old item-variant", "old item variant", "olditem-variant"] or ("old" in c.lower() and "variant" in c.lower())), None)
+    col_new = next((c for c in df.columns if c.lower().strip() in ["new item no.", "new item no", "new item number"] or ("new" in c.lower() and ("no" in c.lower() or "number" in c.lower()))), None)
+    col_desc = next((c for c in df.columns if c.lower().strip() == "description" or "desc" in c.lower()), None)
+    
+    if not col_old or not col_new or not col_desc:
+        return pd.DataFrame(columns=["OLD Item-variant", "Description", "New Item No."])
+        
+    out = df[[col_old, col_desc, col_new]].copy()
+    out.columns = ["OLD Item-variant", "Description", "New Item No."]
+    
+    out["OLD Item-variant"] = out["OLD Item-variant"].astype(str).str.strip().apply(normalize_key)
+    out["New Item No."] = out["New Item No."].astype(str).str.strip()
+    out["Description"] = out["Description"].astype(str).str.strip()
+    return out
+
+def normalize_pcon(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalizes pCon CSV to extract Article No. and Quantity."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
+    
+    norm = {c: re.sub(r"[^a-z0-9]", "", c.lower()) for c in df.columns}
+    
+    article_col = next((c for c in df.columns if norm[c] in {"articleno","article","articlenumber","artno","artnr","artnumber","itemno","itemnumber","articlecode"} or ("article" in norm[c] and "no" in norm[c]) or ("item" in norm[c] and "no" in norm[c])), None)
+    qty_col = next((c for c in df.columns if norm[c] in {"qty","quantity","quantities","qtytotal","qtysum"} or "qty" in norm[c]), None)
+
+    if article_col is None:
+        return pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
+    
+    out = pd.DataFrame()
+    out["ARTICLE_NO"] = df[article_col].astype(str).fillna("").str.strip()
+    
+    if qty_col is not None:
+        out["Quantity"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(1).astype(int)
+    else:
+        out["Quantity"] = 1
+        
+    return out[["ARTICLE_NO", "Quantity"]]
+
+# --- Utils - Data Lookup Functions (Combined) ---
+
+def lookup_data_with_fallback(article_no: str, df: pd.DataFrame, key_col: str, return_col: str, normalize_func=normalize_key) -> str:
+    """Performs direct match then base match lookup."""
+    article_no = str(article_no)
+    
+    # 1. Direct Match
+    try:
+        match_direct = df[df[key_col].apply(normalize_func) == normalize_func(article_no)]
+        if not match_direct.empty:
+            val = match_direct.iloc[0][return_col]
+            return "" if pd.isna(val) else str(val).strip()
+    except Exception:
+        pass
+
+    # 2. Fallback Match (Base Article No)
+    article_base = get_base_article_no(article_no)
+    try:
+        match_fallback = df[df[key_col].apply(get_base_article_no) == article_base]
+        if not match_fallback.empty:
+            val = match_fallback.iloc[0][return_col]
+            return "" if pd.isna(val) else str(val).strip()
+    except Exception:
+        pass
+        
+    return ""
+
+def find_packshot_url(article_no: str, mapping_df: pd.DataFrame, master_df: pd.DataFrame) -> Optional[str]:
+    """Finds Packshot URL using the 3-step lookup logic (pCon -> Mapping -> Master)."""
+    if master_df.empty: return None
+
+    # 1. Find New Item No. using mapping data
+    new_item = find_new_item(article_no, mapping_df)
+    
+    # 2. Lookup in Master Data (using New Item No. if available, otherwise original article_no)
+    lookup_key = new_item if new_item else article_no
+    
+    url = lookup_data_with_fallback(lookup_key, master_df, "ITEM NO.", "IMAGE", normalize_func=normalize_key)
+    
+    return url if url else None
+
+def find_description(article_no: str, mapping_df: pd.DataFrame) -> str:
+    """Finds product description from mapping data."""
+    return lookup_data_with_fallback(article_no, mapping_df, "OLD Item-variant", "Description")
+
+def find_new_item(article_no: str, mapping_df: pd.DataFrame) -> Optional[str]:
+    """Finds the new article number from mapping data."""
+    val = lookup_data_with_fallback(article_no, mapping_df, "OLD Item-variant", "New Item No.")
+    return val if val else None
+
+# --- Utils - File Grouping & PPTX Helpers ---
+
+def group_key_from_filename(name: str) -> Tuple[str, str]:
+    """Extracts group key and file type from the filename (uses everything after ' - ')."""
+    base = Path(name).stem
+    lname = base.lower()
+    
+    if "floorplan" in lname or "line_drawing" in lname or "line drawing" in lname:
+        t = "linedrawing"
+    else:
+        ext = Path(name).suffix.lower()
+        if ext == ".csv":
+            t = "csv"
+        elif ext in [".jpg", ".jpeg", ".png", ".webp"]:
+            t = "render"
+        else:
+            t = "other"
+            
+    if " - " in base:
+        key = base.split(" - ", 1)[1]
+    else:
+        parts = re.split(r"[-_]", base)
+        key = parts[-1] if parts else base
+        
+    key = re.sub(r"\s+(floorplan|line\s*drawing|linedrawing)$", "", key, flags=re.IGNORECASE).strip()
+    return key, t
+
+def build_groups(upload_list: List[Dict]) -> Dict[str, Dict]:
+    """Groups uploaded files based on the extracted key from filename."""
+    groups: Dict[str, Dict] = {}
+    for item in upload_list:
+        name = item["name"]
+        b = item["bytes"]
+        key, t = group_key_from_filename(name)
+        
+        if key not in groups:
+            groups[key] = {"name": key, "csv": None, "render": None, "floorplan": None}
+            
+        if t == "csv":
+            groups[key]["csv"] = b
+        elif t == "render":
+            if groups[key]["render"] is None:
+                groups[key]["render"] = b
+        elif t == "linedrawing":
+            if groups[key]["floorplan"] is None:
+                groups[key]["floorplan"] = b
+                
+    valid_groups = {k: v for k, v in groups.items() if v["csv"] is not None and v["render"] is not None}
+    return valid_groups
+
+def collect_all_renderings(groups: Dict[str, Dict]) -> List[bytes]:
+    """Collects all rendering images bytes from the groups."""
+    return [g["render"] for g in groups.values() if g.get("render")]
+
+def first_run_or_none(shape):
+    """Finds the first 'run' in a shape to preserve formatting."""
+    try:
+        tf = shape.text_frame
+        if tf and tf.paragraphs and tf.paragraphs[0].runs:
+            return tf.paragraphs[0].runs[0]
+    except Exception:
+        return None
+    return None
+
+def set_text_preserve_format(shape, text: str):
+    """Sets text in a shape while trying to preserve the original formatting."""
+    try:
+        if hasattr(shape, "text_frame") and shape.text_frame:
+            run0 = first_run_or_none(shape)
+            if run0:
+                run0.text = text
+            else:
+                shape.text_frame.text = text
+    except Exception:
+        pass
+
+# --- Utils - Image Processing & Insertion ---
+
+def add_picture_contain(slide, shape, image_bytes: bytes):
+    """Inserts an image, ensuring it fits (contain-fit) and converts to compatible JPEG/RGB."""
+    try:
+        if not image_bytes:
+            return
+        
+        im = Image.open(io.BytesIO(image_bytes))
+        
+        if im.mode in ("RGBA", "LA", "P"):
+             im = im.convert("RGB")
+
+        w, h = im.size
+        
+        max_dim = min(MAX_IMAGE_PX, max(w, h))
+        scale_src_cap = min(1.0, max_dim / float(max(w, h)))
+        if scale_src_cap < 1.0:
+            im = im.resize((int(w * scale_src_cap), int(h * scale_src_cap)), Image.Resampling.LANCZOS)
+            w, h = im.size
+
+        frame_w = int(shape.width)
+        frame_h = int(shape.height)
+        
+        s = min(frame_w / w, frame_h / h)
+        s = min(s, 1.0)
+        target_w = max(1, int(w * s))
+        target_h = max(1, int(h * s))
+
+        buf = io.BytesIO()
+        im.resize((target_w, target_h), Image.Resampling.LANCZOS).save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        buf.seek(0)
+
+        left = shape.left + int((shape.width - target_w) / 2)
+        top = shape.top + int((shape.height - target_h) / 2)
+        
+        slide.shapes.add_picture(buf, left, top, width=target_w, height=target_h)
+        
+        try:
+            # Fjerner den eksisterende shape, som fungerer som anker/placeholder
+            if not getattr(shape, "is_placeholder", False):
+                shape.element.getparent().remove(shape.element)
+        except Exception:
+            pass
+        
+    except Exception as e:
+        st.error(f"Image processing failed (check file format/corruption): {type(e).__name__}: {str(e)}")
+        return
+
+def add_picture_into_shape(slide, shape, image_bytes: bytes):
+    """Forces robust contain-fit for all images."""
+    if not image_bytes or shape is None:
+        return
+    add_picture_contain(slide, shape, image_bytes)
+
+# --- PPTX Slide Builders ---
+
+def add_table(slide, anchor_shape, rows: int, cols: int):
+    """Creates a table using the anchor shape's position and size."""
+    try:
+        left = getattr(anchor_shape, 'left', Inches(0.5))
+        top = getattr(anchor_shape, 'top', Inches(1.2))
+        width = getattr(anchor_shape, 'width', Inches(9.0))
+        height = getattr(anchor_shape, 'height', Inches(5.0))
+        
+        table = slide.shapes.add_table(rows, cols, left, top, width, height).table
+        return table
+    except Exception:
+        return None
+
+def inherit_layout_names(slide):
+    """Ensures that shapes in the slide inherit the names from the master layout."""
+    # Dette er en workaround for et kendt python-pptx problem
+    if slide.slide_layout.shapes is None:
+        return
+        
+    master_names = {shape.element.attrib.get('name') for shape in slide.slide_layout.shapes if shape.element.attrib.get('name')}
+    
+    for shape in slide.shapes:
+        try:
+            name = shape.element.attrib.get('name')
+            if name and name not in master_names:
+                 # Sikrer at navnet fra masteren overføres
+                 for master_shape in slide.slide_layout.shapes:
+                     if master_shape.has_text_frame and master_shape.text_frame.text == shape.text_frame.text:
+                         shape.element.set('name', master_shape.element.attrib.get('name'))
+                         break
         except Exception:
             continue
 
-    return pd.DataFrame()
-
-def normalize_column_names(df: pd.DataFrame, target_columns: Dict[str, List[str]]) -> pd.DataFrame:
-    """Normaliserer kolonnenavne baseret på en liste af potentielle navne."""
-    df.columns = [str(col).strip() for col in df.columns]
-    mapping = {}
-    
-    for standard_name, potential_names in target_columns.items():
-        found = False
-        for potential in potential_names:
-            # Case-insensitive match, fjerner mellemrum og tegn.
-            clean_potential = re.sub(r'[^a-z0-9]', '', potential.lower())
-            for current_col in df.columns:
-                clean_current = re.sub(r'[^a-z0-9]', '', current_col.lower())
-                if clean_current == clean_potential:
-                    mapping[current_col] = standard_name
-                    found = True
-                    break
-            if found:
-                break
-    
-    df.rename(columns=mapping, inplace=True)
-    return df
-
-def normalize_master(df: pd.DataFrame) -> pd.DataFrame:
-    """Normaliserer Master Data kolonnenavne (til Packshot URL)."""
-    target_columns = {
-        "ARTICLE_NO": ["Article No.", "Item No.", "Item", "Artikelnummer"],
-        "PACKSHOT_URL": ["Packshot_URL", "URL_Packshot", "Image_URL"]
-    }
-    df = normalize_column_names(df, target_columns)
-    # Beholder kun de nødvendige kolonner
-    df = df.loc[:, df.columns.isin(target_columns.keys())]
-    if "ARTICLE_NO" in df.columns:
-        df["ARTICLE_NO"] = df["ARTICLE_NO"].astype(str).str.strip()
-    return df
-
-def normalize_mapping(df: pd.DataFrame) -> pd.DataFrame:
-    """Normaliserer Mapping Data kolonnenavne (til Beskrivelse og Nyt Nummert)."""
-    target_columns = {
-        "OLD_ARTICLE_NO": ["OLD Item-variant", "Old Item", "Gammelt Varenummer"],
-        "NEW_ARTICLE_NO": ["New Item No.", "New Item", "Nyt Varenummer"],
-        "DESCRIPTION": ["Description", "Beskrivelse", "Product Description"]
-    }
-    df = normalize_column_names(df, target_columns)
-    # Beholder kun de nødvendige kolonner
-    df = df.loc[:, df.columns.isin(target_columns.keys())]
-    if "OLD_ARTICLE_NO" in df.columns:
-        df["OLD_ARTICLE_NO"] = df["OLD_ARTICLE_NO"].astype(str).str.strip()
-    return df
-
-def normalize_pcon(df: pd.DataFrame) -> pd.DataFrame:
-    """Normaliserer Pcon CSV kolonnenavne (fra upload)."""
-    target_columns = {
-        "ARTICLE_NO": ["Article No.", "External Item Number", "Artikelnummer"],
-        "Quantity": ["Quantity", "Antal"]
-    }
-    df = normalize_column_names(df, target_columns)
-    # Beholder kun de nødvendige kolonner
-    df = df.loc[:, df.columns.isin(target_columns.keys())]
-    if "ARTICLE_NO" in df.columns:
-        df["ARTICLE_NO"] = df["ARTICLE_NO"].astype(str).str.strip()
-    # Sikrer Quantity er tilgængelig
-    if "Quantity" not in df.columns:
-        df["Quantity"] = 1 
-    # Fjerner rækker uden et varenummer
-    df.dropna(subset=['ARTICLE_NO'], inplace=True)
-    return df
-
-# --- Utils - PowerPoint ---
-
-def ensure_presentation_from_path(path: Path) -> Presentation:
-    """Opretter eller sikrer en Presentation fra en Path-objekt."""
-    return Presentation(path)
-
-def find_layout_by_name(prs: Presentation, name: str) -> Optional[Any]:
-    """Finder et Slide Layout efter navn (case-insensitive)."""
-    for layout in prs.slide_masters[0].slide_layouts:
-        if layout.name.lower() == name.lower():
-            return layout
-    return None
-
-def layout_has_expected(layout: Any, expected_placeholders: List[str]) -> bool:
-    """Tjekker om et layout har de forventede placeholders (Shape names)."""
-    found_names = {shape.name for shape in layout.shapes}
-    return all(name in found_names for name in expected_placeholders)
-
-def replace_text_in_placeholder(slide, name: str, new_text: str):
-    """Finder en shape med 'name' og erstatter dens tekst."""
-    for shape in slide.shapes:
-        if shape.has_text_frame and shape.name == name:
-            text_frame = shape.text_frame
-            text_frame.clear()
-            p = text_frame.paragraphs[0]
-            p.text = new_text
-            p.font.size = Pt(24)
-            return
-
-def replace_image_in_placeholder(slide, name: str, image_bytes: io.BytesIO):
-    """Finder et placeholder-billede og erstatter kilden."""
-    for shape in slide.shapes:
-        if shape.name == name:
-            # Gemmer position og størrelse fra den eksisterende shape
-            left, top, width, height = shape.left, shape.top, shape.width, shape.height
+def build_overview_slides(prs: Presentation, overview_layout, rendering_bytes_list: List[bytes]):
+    """Builds overview slides using named placeholders in the template."""
+    for batch in chunk(rendering_bytes_list, MAX_OVERVIEW_IMAGES):
+        slide = prs.slides.add_slide(overview_layout)
+        # Sætter navnene på shapes, så de kan findes
+        # Bemærk: Uden en 'inherit_layout_names' funktion, skal vi stole på at shapes i layoutet har navnet.
+        shape_map = build_shape_map(slide)
+        
+        for idx, img_bytes in enumerate(batch, start=1):
+            if not img_bytes: continue
             
-            # Sletter den gamle shape
-            sp = shape.element
-            sp.getparent().remove(sp)
-            
-            # Indsætter det nye billede og tilpasser dets størrelse og position
-            try:
-                slide.shapes.add_picture(image_bytes, left, top, width, height)
-            except Exception as e:
-                st.warning(f"Kunne ikke indsætte billede for '{name}': {e}")
-            return
+            # Leder efter Renderings1, Renderings2, osv.
+            pic_key = clean_name(f"Rendering{idx}")
+            target_shape = safe_find_shape(shape_map, pic_key)
 
-def add_table_to_slide(slide, table_data: List[List[str]], table_anchor_name: str):
-    """Tilføjer en tabel til et slide og bruger TableAnchor for positionering."""
-    anchor = None
-    for shape in slide.shapes:
-        if shape.name == table_anchor_name:
-            anchor = shape
+            if target_shape:
+                 add_picture_into_shape(slide, target_shape, img_bytes)
+
+def build_setting_slide(prs: Presentation,
+                        setting_layout,
+                        group_name: str,
+                        render_bytes: Optional[bytes],
+                        floorplan_bytes: Optional[bytes],
+                        products_df: pd.DataFrame,
+                        mapping_df: pd.DataFrame,
+                        master_df: pd.DataFrame):
+    """Builds individual setting slides using named placeholders in the template."""
+    slide = prs.slides.add_slide(setting_layout)
+    shape_map = build_shape_map(slide)
+    
+    # 1. Title
+    title_shape = safe_find_shape(shape_map, "SETTINGNAME")
+    if title_shape:
+        set_text_preserve_format(title_shape, group_name.replace("-", " ").title())
+        
+    # 2. Images
+    render_shape = safe_find_shape(shape_map, "Rendering")
+    if render_shape and render_bytes:
+        add_picture_into_shape(slide, render_shape, render_bytes)
+    elif render_shape:
+        set_text_preserve_format(render_shape, "RENDERING IMAGE MISSING")
+        
+    floorplan_shape = safe_find_shape(shape_map, "Linedrawing") 
+    if floorplan_shape and floorplan_bytes:
+        add_picture_into_shape(slide, floorplan_shape, floorplan_bytes)
+    elif floorplan_shape:
+        set_text_preserve_format(floorplan_shape, "LINE DRAWING MISSING")
+        
+    # 3. Products and Descriptions
+    for i in range(1, MAX_OVERVIEW_IMAGES + 1): 
+        if i > len(products_df):
             break
-    
-    if anchor is None:
-        st.warning(f"WARNING: '{table_anchor_name}' mangler i '{slide.slide_layout.name}'. Bruger standard position.")
-        left = Inches(1)
-        top = Inches(2)
-        width = Inches(8)
-        height = Inches(4)
-    else:
-        left, top, width, height = anchor.left, anchor.top, anchor.width, anchor.height
+            
+        row = products_df.iloc[i-1] 
+        article_no = row["ARTICLE_NO"]
+        
+        # Lookups
+        pack_url = find_packshot_url(article_no, mapping_df, master_df)
+        desc = find_description(article_no, mapping_df)
+        
+        # a) Packshot image (fetch and insert)
+        # Leder efter Packshot1, Packshot2, osv. (koden har fallback til productpackshot)
+        pic_key = clean_name(f"ProductPackshot{i}")
+        pic_shape = safe_find_shape(shape_map, pic_key)
+        
+        if pic_shape:
+            img_bytes = http_get_bytes(pack_url) if pack_url else None
+            if img_bytes:
+                add_picture_into_shape(slide, pic_shape, img_bytes)
+            elif pack_url:
+                set_text_preserve_format(pic_shape, "IMAGE URL FOUND, DOWNLOAD FAILED")
+            else:
+                set_text_preserve_format(pic_shape, f"PACKSHOT LOOKUP FAILED for {article_no}")
+            
+        # b) Product Description
+        desc_key = clean_name(f"PRODUCT DESCRIPTION {i}")
+        desc_shape = safe_find_shape(shape_map, desc_key)
+        
+        if desc_shape:
+            set_text_preserve_format(desc_shape, desc)
 
-    if not table_data:
+def build_productlist_slide(prs: Presentation,
+                            layout,
+                            group_name: str,
+                            products_df: pd.DataFrame,
+                            mapping_df: pd.DataFrame):
+    """Builds the product list slide with a table."""
+    slide = prs.slides.add_slide(layout)
+    shape_map = build_shape_map(slide)
+
+    # 1. Title
+    title_shape = safe_find_shape(shape_map, "Title") or safe_find_shape(shape_map, "SETTINGNAME")
+    if title_shape:
+        set_text_preserve_format(title_shape, f"Produkter – {group_name.replace('-', ' ').title()}")
+        
+    # 2. Table Anchor
+    anchor = safe_find_shape(shape_map, "TableAnchor")
+    
+    if not anchor:
+        st.warning(f"WARNING: 'TableAnchor' missing in '{layout.name}'. Using default position.")
+    
+    rows = max(1, len(products_df)) + 1
+    cols = 3
+    table = add_table(slide, anchor, rows, cols)
+    
+    if table is None:
         return
         
-    num_rows = len(table_data)
-    num_cols = len(table_data[0])
+    # 3. Fill Table
+    table.cell(0, 0).text = "Quantity"
+    table.cell(0, 1).text = "Description"
+    table.cell(0, 2).text = "Article No. / New Item No."
+    
+    r = 1
+    for row in products_df.itertuples(index=False):
+        article_no = row.ARTICLE_NO
+        
+        # Lookups
+        desc = find_description(article_no, mapping_df)
+        new_item = find_new_item(article_no, mapping_df)
+        
+        table.cell(r, 0).text = str(int(row.Quantity))
+        table.cell(r, 1).text = desc
+        
+        article_text = f"{article_no} / {new_item}" if new_item else f"{article_no}"
+        table.cell(r, 2).text = article_text
+        r += 1
 
-    shape = slide.shapes.add_table(num_rows, num_cols, left, top, width, height)
-    table = shape.table
+# --- PPTX Utility Functions (Other) ---
 
-    # Overskrift (Headers)
-    for col_idx, text in enumerate(table_data[0]):
-        cell = table.cell(0, col_idx)
-        cell.text = text
-        text_frame = cell.text_frame
-        p = text_frame.paragraphs[0]
-        p.font.bold = True
-        p.font.size = Pt(12)
+def chunk(lst, n):
+    """Splits a list into chunks of size n."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
 
-    # Indhold (Body)
-    for row_idx, row_data in enumerate(table_data[1:]):
-        for col_idx, text in enumerate(row_data):
-            cell = table.cell(row_idx + 1, col_idx)
-            cell.text = text
-            text_frame = cell.text_frame
-            p = text_frame.paragraphs[0]
-            p.font.size = Pt(10)
-
-def safe_present(prs: Presentation) -> io.BytesIO:
-    """Gemmer præsentationen i en BytesIO-buffer."""
-    with io.BytesIO() as buffer:
-        prs.save(buffer)
-        buffer.seek(0)
-        return buffer
-
-# --- Utils - Grouping and Mapping Logic ---
-
-def find_packshot_url(article_no: str, master_df: pd.DataFrame) -> Optional[str]:
-    """Slår Packshot URL op i Master Data DF. Prioriterer eksakt match."""
-    match = master_df[master_df["ARTICLE_NO"] == article_no]
-    if not match.empty and "PACKSHOT_URL" in match.columns:
-        return match["PACKSHOT_URL"].iloc[0]
+def find_layout_by_name(prs: Presentation, target: str):
+    """Finds a layout by name (clean match)."""
+    t = clean_name(target)
+    for layout in prs.slide_layouts:
+        if clean_name(layout.name) == t:
+            return layout
+    # Tilføjer fallback for Overview/Renderings, da de bruges skiftevis
+    if t == clean_name('Renderings'):
+        return find_layout_by_name(prs, 'Overview')
+    if t == clean_name('Overview'):
+        return find_layout_by_name(prs, 'Renderings')
+    
     return None
 
-def find_mapping_data(article_no: str, mapping_df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
-    """Slår New Article No. og Beskrivelse op i Mapping Data DF."""
-    # Prioriterer eksakt match på det fulde varenummer
-    match = mapping_df[mapping_df["OLD_ARTICLE_NO"] == article_no]
-    
-    if match.empty:
-        # Fallback: Prøver at matche på basis-varenummeret (første del)
-        base_article = article_no.split('-')[0].split('_')[0]
-        match = mapping_df[mapping_df["OLD_ARTICLE_NO"] == base_article]
-    
-    if not match.empty:
-        desc = match["DESCRIPTION"].iloc[0] if "DESCRIPTION" in match.columns else None
-        new_no = match["NEW_ARTICLE_NO"].iloc[0] if "NEW_ARTICLE_NO" in match.columns else None
-        return desc, new_no
-    
-    return None, None # Hvis intet match
+def ensure_presentation_from_path(path: Path) -> Presentation:
+    """Ensures the template file exists and can be loaded."""
+    if not path.exists():
+        raise FileNotFoundError(f"Template not found: {path}")
+    return Presentation(str(path))
 
-def get_product_details(article_no: str, mapping_df: pd.DataFrame, master_df: pd.DataFrame) -> Dict[str, Optional[str]]:
-    """Samler alle detaljer for et givent varenummer."""
-    details = {"DESCRIPTION": None, "NEW_ARTICLE_NO": None, "PACKSHOT_URL": None}
-    
-    if mapping_df.empty:
-        st.info("Mapping data er tom. Kan ikke finde beskrivelse/nyt varenummer.")
-    else:
-        desc, new_no = find_mapping_data(article_no, mapping_df)
-        details["DESCRIPTION"] = desc
-        details["NEW_ARTICLE_NO"] = new_no
+def layout_has_expected(layout, keys: List[str]) -> bool:
+    """Checks if the layout contains the expected placeholders."""
+    try:
+        names = {clean_name(getattr(sh, "name", "")) for sh in layout.shapes}
+    except Exception:
+        names = set()
         
-    # Packshot URL skal findes via det NYE varenummer, hvis det findes, ellers det GAMLE.
-    lookup_no = details["NEW_ARTICLE_NO"] if details["NEW_ARTICLE_NO"] else article_no
-    
-    if master_df.empty:
-        st.info("Master data er tom. Kan ikke finde Packshot URL.")
-    else:
-        packshot_url = find_packshot_url(lookup_no, master_df)
-        if packshot_url is None:
-            # Prøv fallback til det gamle nummer, hvis det nye nummer ikke virkede
-            if details["NEW_ARTICLE_NO"] and details["NEW_ARTICLE_NO"] != article_no:
-                packshot_url = find_packshot_url(article_no, master_df)
-
-        details["PACKSHOT_URL"] = packshot_url
-        
-    return details
-
-# --- Utils - Preflight and Grouping ---
+    return all(clean_name(k) in names for k in keys)
 
 def preflight_checks() -> Dict[str, str]:
-    """Kører tjek på template filen."""
-    diag = {"template": "OK"}
+    """Performs preflight checks for template and remote CSVs."""
+    results = {"template": "OK"}
+    
     if not TEMPLATE_PATH.exists():
-        diag["template"] = f"Template filen '{TEMPLATE_PATH}' mangler."
-        return diag
+        results["template"] = f"Template not found ({TEMPLATE_PATH})."
+        return results
     
     try:
         prs = Presentation(TEMPLATE_PATH)
-        required_layouts = ["Overview", "Renderings", "Setting", "ProductListBlank"]
-        for name in required_layouts:
-            if not find_layout_by_name(prs, name):
-                diag["template"] = f"Mangler påkrævet layout '{name}' i Slide Master."
-                return diag
+        
+        # 1. Overview/Renderings Check (Kræver navnet 'Renderings' eller et tilsvarende)
+        if not find_layout_by_name(prs, 'Renderings'):
+            results["template"] = "Mangler påkrævet layout 'Renderings' (til Overview-siden) i Slide Master."
+            return results
 
-        # Specifik tjek for TableAnchor i ProductListBlank
-        productlist_layout = find_layout_by_name(prs, "ProductListBlank")
-        if productlist_layout and not layout_has_expected(productlist_layout, ["TableAnchor"]):
-            st.warning("WARNING: 'TableAnchor' mangler i 'ProductListBlank'. Bruger standard position.")
+        # 2. Setting Check
+        if not find_layout_by_name(prs, 'Setting'):
+            results["template"] = "Mangler påkrævet layout 'Setting' i Slide Master."
+            return results
+
+        # 3. ProductListBlank Check
+        productlist_layout = find_layout_by_name(prs, 'ProductListBlank')
+        if not productlist_layout:
+            results["template"] = "Mangler påkrævet layout 'ProductListBlank' i Slide Master."
+            return results
+        
+        # 4. TableAnchor Warning
+        if not layout_has_expected(productlist_layout, ["TableAnchor"]):
+            results["template"] += " ADVARSEL: TableAnchor mangler i ProductListBlank."
             
     except Exception as e:
-        diag["template"] = f"Fejl ved indlæsning af template: {e}"
+        results["template"] = f"Fejl ved indlæsning af template: {e}"
         
-    return diag
-
-def build_groups(uploads: List[Any]) -> Dict[str, Dict[str, Any]]:
-    """Grupperer uploads baseret på deres filnavn prefix."""
-    groups: Dict[str, Dict[str, Any]] = {}
-    
-    for uploaded_file in uploads:
-        name_parts = uploaded_file.name.rsplit('.', 1)
-        if len(name_parts) < 2:
-            continue
-        
-        base_name = name_parts[0]
-        ext = name_parts[1].lower()
-        
-        # Ekstraherer gruppens navn fra filnavnet (navnet efter sidste bindestreg)
-        group_match = re.search(r'-\s*([^-]+)$', base_name)
-        group_key = group_match.group(1).strip().lower().replace(" ", "") if group_match else base_name.lower().replace(" ", "")
-
-        if group_key not in groups:
-            groups[group_key] = {"name": group_key, "csv": None, "render": None, "floorplan": None}
-
-        if ext == 'csv':
-            groups[group_key]['csv'] = uploaded_file.getvalue()
-        elif ext in ['jpg', 'jpeg', 'png', 'webp']:
-            # Tjekker om det er en floorplan ved at søge efter "floorplan" i navnet.
-            if "floorplan" in uploaded_file.name.lower():
-                groups[group_key]['floorplan'] = io.BytesIO(uploaded_file.getvalue())
-            else:
-                groups[group_key]['render'] = io.BytesIO(uploaded_file.getvalue())
-
-    # Filtrer grupper der mangler CSV
-    valid_groups = {k: v for k, v in groups.items() if v["csv"] is not None}
-    return valid_groups
-
-def collect_all_renderings(groups: Dict[str, Dict[str, Any]]) -> List[io.BytesIO]:
-    """Samler alle renderings for overview-slides."""
-    renders = []
-    for g in groups.values():
-        if g["render"]:
-            renders.append(g["render"])
-    return renders
-
-# --- Slide Builders ---
-
-def build_overview_slides(prs: Presentation, layout: Any, renders: List[io.BytesIO]):
-    """Bygger Overview-slides med op til 12 renderings pr. slide."""
-    
-    # Henter placeholder navne, der ligner 'Rendering1', 'Rendering2', osv.
-    render_placeholders = [shape.name for shape in layout.shapes if re.match(r"Rendering\d+", shape.name)]
-    render_placeholders.sort(key=lambda x: int(re.search(r'\d+', x).group(0)))
-    
-    batch_size = len(render_placeholders)
-
-    for i in range(0, len(renders), batch_size):
-        slide = prs.slides.add_slide(layout)
-        batch = renders[i:i + batch_size]
-        
-        for j, render_bytes in enumerate(batch):
-            placeholder_name = render_placeholders[j]
-            replace_image_in_placeholder(slide, placeholder_name, render_bytes)
-
-def build_setting_slide(prs: Presentation, layout: Any, group_name: str, render_bytes: Optional[io.BytesIO], floorplan_bytes: Optional[io.BytesIO], pcon_df: pd.DataFrame, mapping_df: pd.DataFrame, master_df: pd.DataFrame):
-    """Bygger et Setting-slide med billeder og produktdetaljer."""
-    slide = prs.slides.add_slide(layout)
-    
-    replace_text_in_placeholder(slide, "SETTINGNAME", group_name.replace("-", " ").title())
-    
-    if render_bytes:
-        replace_image_in_placeholder(slide, "Rendering", render_bytes)
-    if floorplan_bytes:
-        # Tjekker for det korrekte navn (Linedrawing)
-        replace_image_in_placeholder(slide, "Linedrawing", floorplan_bytes)
-
-    # Udfyld produktinformation (Packshot og Beskrivelse)
-    for i, (_, row) in enumerate(pcon_df.head(12).iterrows()): # Max 12 produkter
-        article_no = row["ARTICLE_NO"]
-        
-        # Henter detaljer (Packshot URL, Beskrivelse, Nyt Varenummer)
-        details = get_product_details(article_no, mapping_df, master_df)
-        
-        desc = details["DESCRIPTION"]
-        packshot_url = details["PACKSHOT_URL"]
-        
-        # Udfyld Beskrivelse
-        desc_placeholder_name = f"PRODUCT DESCRIPTION {i + 1}"
-        description_text = desc if desc else f"*** BESKRIVELSE MANGLER ({article_no}) ***"
-        replace_text_in_placeholder(slide, desc_placeholder_name, description_text)
-
-        # Udfyld Packshot
-        if packshot_url:
-            packshot_bytes = http_get_bytes(packshot_url)
-            if packshot_bytes:
-                packshot_placeholder_name = f"ProductPackshot{i + 1}"
-                replace_image_in_placeholder(slide, packshot_placeholder_name, packshot_bytes)
-            else:
-                st.warning(f"Kunne ikke hente Packshot fra URL: {packshot_url}")
-        else:
-            st.warning(f"Packshot URL mangler for: {article_no}")
-
-def build_productlist_slide(prs: Presentation, layout: Any, group_name: str, pcon_df: pd.DataFrame, mapping_df: pd.DataFrame):
-    """Bygger et slide med en komplet produktliste i tabelformat."""
-    slide = prs.slides.add_slide(layout)
-    replace_text_in_placeholder(slide, "SETTINGNAME", f"Produkter – {group_name.replace('-', ' ').title()}")
-
-    table_data = [["Quantity", "Description", "Article No. / New Item No."]]
-
-    for _, row in pcon_df.iterrows():
-        article_no = row["ARTICLE_NO"]
-        quantity = str(int(row["Quantity"]))
-        
-        # Henter beskrivelse og nyt varenummer
-        desc, new_no = find_mapping_data(article_no, mapping_df)
-        
-        description_text = desc if desc else "*** BESKRIVELSE MANGLER ***"
-        
-        article_text = article_no
-        if new_no:
-            article_text = f"{article_no} / {new_no}"
-        
-        table_data.append([quantity, description_text, article_text])
-
-    add_table_to_slide(slide, table_data, "TableAnchor")
-
+    return results
 
 # ---------------------- UI ----------------------
 st.set_page_config(page_title="Muuto PowerPoint Generator", layout="centered")
 st.title("Muuto PowerPoint Generator")
-st.write("Upload dine grupperede filer (CSV og billeder). App'en bruger den faste PowerPoint-template og henter Master Data og Mapping fra faste URLs.")
+st.write("Upload your group files (CSV and images). The app uses the fixed PowerPoint template and fetches Master Data and Mapping from fixed URLs.")
 
-# Initialize session state for uploads and generated dataframes
-if 'uploads' not in st.session_state:
+if "uploads" not in st.session_state:
     st.session_state.uploads = []
-if 'last_master_df' not in st.session_state:
+if "last_master_df" not in st.session_state:
     st.session_state.last_master_df = None
-if 'last_mapping_df' not in st.session_state:
+if "last_mapping_df" not in st.session_state:
     st.session_state.last_mapping_df = None
 
-uploaded_files = st.file_uploader(
-    "Upload dine indstillingsfiler (CSV, Rendering, Floorplan).",
-    type=['csv', 'jpg', 'jpeg', 'png', 'webp', 'pptx'],
-    accept_multiple_files=True
+
+files = st.file_uploader(
+    "User group files (.csv, .jpg, .png, .webp). You can add multiple files.",
+    type=["csv", "jpg", "jpeg", "png", "webp"],
+    accept_multiple_files=True,
 )
 
-if uploaded_files:
-    st.session_state.uploads = uploaded_files
-    st.info(f"{len(st.session_state.uploads)} filer er klar til behandling.")
+if files:
+    existing = {u["name"] for u in st.session_state.uploads}
+    for f in files:
+        if f.name not in existing:
+            st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
+            existing.add(f.name)
 
-generate = st.button("Generér PowerPoint")
+# Single flat file list with remove buttons
+if st.session_state.uploads:
+    st.subheader("Uploaded Files")
+    remove_indices = []
+    for idx, item in enumerate(st.session_state.uploads):
+        col1, col2 = st.columns([0.9, 0.1])
+        with col1:
+            size_kb = len(item["bytes"]) / 1024.0
+            st.write(f"{item['name']} — {size_kb:.1f}KB")
+        with col2:
+            if st.button("❌", key=f"rm_{idx}"):
+                remove_indices.append(idx)
+    if remove_indices:
+        for i in sorted(remove_indices, reverse=True):
+            del st.session_state.uploads[i]
+        st.rerun()
+
+generate = st.button("Generate Presentation")
 
 # ---------------------- Orchestration ----------------------
 if generate:
-    with st.spinner("Arbejder..."):
+    with st.spinner("Working..."):
         diag = preflight_checks()
-        if diag.get("template") != "OK":
-            st.error("Template problem: " + diag.get("template", "Ukendt"))
+        # Tjekker om der er en FATAL fejl (ikke kun ADVARSEL)
+        if "Mangler påkrævet layout" in diag["template"] or "Fejl ved indlæsning" in diag["template"]:
+            st.error("Template problem: " + diag["template"])
         elif not TEMPLATE_PATH.exists():
-            st.error("Template filen mangler i repository: input-template.pptx")
+            st.error("Template file is missing in the repository: input-template.pptx")
         else:
             try:
                 groups = build_groups(st.session_state.uploads)
 
                 if not groups:
-                    st.error("Kunne ikke danne nogen grupper. Sørg for at filer er uploadet og filnavne indeholder CSV og mindst ét billede/floorplan.")
+                    st.error("Could not form any groups. Please ensure files are uploaded and filenames contain CSV and at least one image/floorplan.")
                     
                 if groups:
                     prs = ensure_presentation_from_path(TEMPLATE_PATH)
 
-                    overview_layout = find_layout_by_name(prs, "Overview") or find_layout_by_name(prs, "Renderings")
+                    # Henter layouts (bruger Renderings først, men har fallback til Overview)
+                    overview_layout = find_layout_by_name(prs, "Renderings")
                     setting_layout = find_layout_by_name(prs, "Setting")
                     productlist_layout = find_layout_by_name(prs, "ProductListBlank")
 
-                    # --- LIVE DATA LOAD MED DIAGNOSTICS ---
                     master_raw = load_remote_csv(DEFAULT_MASTER_URL)
                     mapping_raw = load_remote_csv(DEFAULT_MAPPING_URL)
 
@@ -485,23 +691,20 @@ if generate:
                     st.session_state.last_master_df = master_df
                     st.session_state.last_mapping_df = mapping_df
                     
-                    # --- DIAGNOSTIC OUTPUT (HVIS MAPPING FEJLEDE) ---
+                    # --- DIAGNOSTIK OG ADVARSLER ---
                     if mapping_df.empty:
-                        st.warning("ADVARSEL: Mapping Data (Beskrivelser/Nye Artikelnumre) kunne ikke indlæses. Beskrivelser og nye varenumre vil mangle.")
+                        st.warning("ADVARSEL: Mapping Data (Beskrivelser/Nye Artikelnumre) kunne ikke indlæses.")
                         if not mapping_raw.empty:
-                            st.warning("Mapping CSV blev hentet, men data normalisering fejlede. Tjek kolonnerne for korrekt navngivning (f.eks. 'OLD Item-variant', 'New Item No.', 'Description'):")
-                            st.dataframe(mapping_raw.head(3).T) # Viser de første 3 rækker og kolonner for fejlfinding
+                            st.warning("Mapping CSV blev hentet, men normalisering fejlede. Tjek kolonnenavne i tabellen nedenfor:")
+                            st.dataframe(mapping_raw.head(3).T)
                     
                     if master_df.empty:
-                         st.warning("ADVARSEL: Master Data (Billed-URLs) kunne ikke indlæses. Packshots vil mangle.")
-                    # ---------------------------------------------
-
+                         st.warning("ADVARSEL: Master Data (Billed-URLs) kunne ikke indlæses.")
+                    
                     # 1. Overview Slides
                     renders = collect_all_renderings(groups)
-                    if renders:
-                        if overview_layout and layout_has_expected(overview_layout, ["Rendering1"]):
-                            build_overview_slides(prs, overview_layout, renders)
-                    
+                    if renders and overview_layout:
+                        build_overview_slides(prs, overview_layout, renders)
 
                     # 2. Per group Slides
                     for key in sorted(groups.keys()):
@@ -510,10 +713,8 @@ if generate:
                         
                         try:
                             pcon_df = normalize_pcon(parse_csv_flex(g["csv"]))
-                        except Exception as e:
+                        except Exception:
                             pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
-                            st.error(f"Fejl ved parsing af CSV for gruppe '{group_name}': {e}")
-                            
                         
                         if pcon_df.empty:
                             st.warning(f"ADVARSEL: Kunne ikke indlæse produktdata fra CSV for gruppe '{group_name}'. Springer slides over.")
@@ -523,16 +724,18 @@ if generate:
                         floorplan_bytes = g.get("floorplan")
 
                         # Setting Slide
-                        if setting_layout and layout_has_expected(setting_layout, ["SETTINGNAME", "Rendering", "Linedrawing", "ProductPackshot1"]):
+                        if setting_layout:
                             build_setting_slide(prs, setting_layout, group_name, render_bytes, floorplan_bytes, pcon_df, mapping_df, master_df)
                         else:
-                            st.info(f"INFO: Setting slide for '{group_name}' kunne ikke bruge template layout (Tjek placeholder navne).")
+                            st.error(f"FATAL FEJL: Layout 'Setting' blev ikke fundet under preflight check. Stop.")
+                            raise Exception("Missing required layout 'Setting'")
 
                         # Product List Slide
                         if productlist_layout:
                             build_productlist_slide(prs, productlist_layout, group_name, pcon_df, mapping_df)
                         else:
-                            st.info(f"INFO: Product List slide for '{group_name}' kunne ikke bruge template layout.")
+                            st.error(f"FATAL FEJL: Layout 'ProductListBlank' blev ikke fundet under preflight check. Stop.")
+                            raise Exception("Missing required layout 'ProductListBlank'")
 
                     ppt_bytes = safe_present(prs)
                     st.success("Din præsentation er klar!")
@@ -543,6 +746,7 @@ if generate:
                         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                     )
             except Exception as e:
+                # Fanger fejl fra de interne raise Exception kald
                 st.error(f"Der opstod en fejl under generering af præsentationen: {e}")
                 
 # UI for data status
@@ -553,3 +757,19 @@ if st.session_state.last_master_df is not None and st.session_state.last_mapping
     col_mp.metric("Mapping Data Rækker", st.session_state.last_mapping_df.shape[0])
     if st.session_state.last_master_df.empty or st.session_state.last_mapping_df.empty:
         st.warning("ADVARSEL: Nul rækker indlæst fra Master/Mapping CSV'er. Tjek URL-tilgængelighed og kolonnenavne i CSV-dataen.")
+```eof
+
+### ⚠️ Næste trin, hvis fejlen fortsætter
+
+Hvis du *stadig* får en fejl efter at have kørt koden ovenfor, er det altafgørende at **dobbelt-tjekke stavningen** inde i PowerPoint:
+
+1.  Åbn din `input-template.pptx`.
+2.  Gå til **Vis** > **Slidemaster**.
+3.  Klik på hvert af de tre layouts.
+4.  Kig i ruden, hvor du kan omdøbe layoutet (normalt venstre side, højreklik på layoutet).
+5.  **Navnet skal præcist være:**
+    * **`Renderings`**
+    * **`Setting`**
+    * **`ProductListBlank`**
+
+Koden er nu sat til at rapportere, hvis et af de tre navne mangler, og **den vil ikke nævne "Overview" i fejlen**. Hvis den næste fejl stadig er relateret til et layout, vil den nu være meget mere præcis.
