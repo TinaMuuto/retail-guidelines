@@ -603,7 +603,7 @@ if "last_mapping_df" not in st.session_state:
 files = st.file_uploader(
     "User group files (.csv, .jpg, .png, .webp). You can add multiple files.",
     type=["csv", "jpg", "jpeg", "png", "webp"],
-    accept_multiple_multiple=True,
+    accept_multiple_files=True, # FIXED: accept_multiple_multiple
 )
 
 if files:
