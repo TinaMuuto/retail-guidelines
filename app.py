@@ -5,28 +5,26 @@ from typing import Dict, List, Optional, Tuple
 import streamlit as st
 import pandas as pd
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image
 from pptx import Presentation
-from pptx.util import Inches, Pt
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-from pptx.dml.color import RGBColor
+from pptx.util import Inches
 import requests
 import time
+from pathlib import Path
 
 # -----------------------------
 # Constants and defaults
 # -----------------------------
+# IMPORTANT: python-pptx kan kun læse .pptx. Sørg for at skabelonen er .pptx.
+TEMPLATE_PATH = Path("input-template.pptx")  # forventes at ligge i repo-roden sammen med app.py
 DEFAULT_MASTER_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdNwE1Q_aG3BntCZZPRIOgXEFJ5AHJxHmRgirMx2FJqfttgCZ8on-j1vzxM-muTTvtAHwc-ovDV1qF/pub?output=csv"
 DEFAULT_MAPPING_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQPRmVmc0LYISduQdJyfz-X3LJlxiEDCNwW53LhFsWp5fFDS8V669rCd9VGoygBZSAZXeSNZ5fquPen/pub?output=csv"
 OUTPUT_NAME = "Muuto_Settings.pptx"
 MAX_OVERVIEW_IMAGES = 12
 HTTP_TIMEOUT = 10
-HTTP_RETRIES = 1  # one retry as required
-MAX_IMAGE_PX = 1400  # do not upscale
+HTTP_RETRIES = 1
+MAX_IMAGE_PX = 1400
 JPEG_QUALITY = 85
-
-# Optional developer flag
-RUN_TEST_MODE = False
 
 # -----------------------------
 # Utilities
@@ -34,7 +32,6 @@ RUN_TEST_MODE = False
 def clean_name(name: str) -> str:
     if name is None:
         return ""
-    # strip {{ }} and whitespace, make case-insensitive comparable token without spaces
     name = name.strip()
     name = re.sub(r"^\{\{|\}\}$", "", name).strip()
     return re.sub(r"\s+", "", name).lower()
@@ -49,17 +46,15 @@ def first_run_or_none(shape):
     return None
 
 def set_text_preserve_format(shape, text: str):
-    """Replace text content while preserving existing formatting if possible."""
     try:
         if hasattr(shape, "text_frame") and shape.text_frame:
             run0 = first_run_or_none(shape)
             if run0:
                 run0.text = text
             else:
-                # Fallback: simple assignment. Formatting may reset but avoids crash.
                 shape.text_frame.text = text
     except Exception:
-        pass  # silent per requirement
+        pass
 
 def build_shape_map(slide) -> Dict[str, object]:
     mapping = {}
@@ -73,13 +68,11 @@ def build_shape_map(slide) -> Dict[str, object]:
     return mapping
 
 def add_picture_contain(slide, shape, image_bytes: bytes):
-    """Add image that fits inside given shape box, contain fit, centered, no upscale beyond source."""
     try:
         if not image_bytes:
             return
         with Image.open(io.BytesIO(image_bytes)) as im:
             im = im.convert("RGB")
-            # Cap max dimension without upscaling beyond source
             w, h = im.size
             max_dim = min(MAX_IMAGE_PX, max(w, h))
             scale = min(1.0, max_dim / float(max(w, h)))
@@ -87,30 +80,24 @@ def add_picture_contain(slide, shape, image_bytes: bytes):
             if scale < 1.0:
                 im = im.resize((new_w, new_h), Image.LANCZOS)
 
-            # Fit into placeholder
             frame_w = int(shape.width)
             frame_h = int(shape.height)
-            # Compute scale to fit inside while preserving aspect
             s = min(frame_w / im.width, frame_h / im.height)
-            # Do not upscale beyond resized image size
             s = min(s, 1.0)
             target_w = int(im.width * s)
             target_h = int(im.height * s)
-            # Create canvas and paste centered
+
             canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
             canvas.paste(im.resize((target_w, target_h), Image.LANCZOS), (0, 0))
 
-            # Save to bytes
             out = io.BytesIO()
             canvas.save(out, format="JPEG", quality=JPEG_QUALITY, optimize=True)
             out.seek(0)
 
-            # Compute centering offsets inside the shape box
             left = shape.left + int((shape.width - target_w) / 2)
             top = shape.top + int((shape.height - target_h) / 2)
             slide.shapes.add_picture(out, left, top, width=target_w, height=target_h)
     except Exception:
-        # Skip silently if image fails
         return
 
 def add_table(slide, anchor_shape, rows: int, cols: int):
@@ -153,15 +140,9 @@ def parse_csv_flex(buf: bytes) -> pd.DataFrame:
     return pd.DataFrame()
 
 def group_key_from_filename(name: str) -> Tuple[str, str]:
-    """Return group key and file type hint ('csv','render','floorplan','linedrawing')."""
     base = Path(name).stem
-    # Split prefix before first '-' or '_'
     m = re.split(r"[-_]", base, maxsplit=1)
     prefix = m[0].strip() if m else base.strip()
-    # Use last token for a nicer name if present: e.g., "Shop-the-look_2025_Q2 - dining 01" -> "dining 01"
-    # But the rule states 'prefix before first - or _' defines group. We'll derive display name as trailing token after space if present.
-    display = base
-    # Normalize type
     lname = name.lower()
     if "floorplan" in lname:
         t = "floorplan"
@@ -175,12 +156,6 @@ def group_key_from_filename(name: str) -> Tuple[str, str]:
             t = "render"
         else:
             t = "other"
-    # Group name shown: use the remaining part after delimiter if available
-    display_name = base
-    if " - " in name:
-        display_name = name.split(" - ", 1)[-1].rsplit(".", 1)[0].strip()
-    elif "_" in name:
-        display_name = name.split("_", 1)[-1].rsplit(".", 1)[0].strip()
     return prefix, t
 
 def base_before_dash(s: str) -> str:
@@ -193,20 +168,20 @@ def find_layout_by_name(prs: Presentation, target: str):
     for layout in prs.slide_layouts:
         if clean_name(layout.name) == t:
             return layout
-    # fallback: try contains match
     for layout in prs.slide_layouts:
         if t in clean_name(layout.name):
             return layout
     return None
 
-def ensure_presentation(template_bytes: bytes) -> Presentation:
-    # Always load from template. Slides may be zero, which is fine.
-    return Presentation(io.BytesIO(template_bytes))
+def ensure_presentation_from_path(path: Path) -> Presentation:
+    if not path.exists():
+        raise FileNotFoundError(f"Template not found: {path}")
+    return Presentation(str(path))
 
 # -----------------------------
 # Domain logic
 # -----------------------------
-def load_remote_csv(url: str, label: str) -> pd.DataFrame:
+def load_remote_csv(url: str) -> pd.DataFrame:
     content = http_get_bytes(url)
     if content is None:
         return pd.DataFrame()
@@ -216,17 +191,14 @@ def load_remote_csv(url: str, label: str) -> pd.DataFrame:
 def normalize_master(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["ITEM NO.", "IMAGE"])
-    # Standardize column names
     cols = {c: c.strip() for c in df.columns}
     df = df.rename(columns=cols)
-    # Find image url column
     img_col = None
     for c in df.columns:
         if c.upper() in ["IMAGE URL", "IMAGE DOWNLOAD LINK"]:
             img_col = c
             break
     if img_col is None:
-        # try fuzzy
         for c in df.columns:
             if "image" in c.lower() and ("url" in c.lower() or "download" in c.lower()):
                 img_col = c
@@ -237,13 +209,11 @@ def normalize_master(df: pd.DataFrame) -> pd.DataFrame:
             item_col = c
             break
     if item_col is None:
-        # Try variants
         for c in df.columns:
             if "item" in c.lower() and "no" in c.lower():
                 item_col = c
                 break
     if item_col is None or img_col is None:
-        # Return empty if key columns missing
         return pd.DataFrame(columns=["ITEM NO.", "IMAGE"])
     out = df[[item_col, img_col]].copy()
     out.columns = ["ITEM NO.", "IMAGE"]
@@ -255,7 +225,6 @@ def normalize_mapping(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["OLD Item-variant", "Description", "New Item No."])
     cols = {c: c.strip() for c in df.columns}
     df = df.rename(columns=cols)
-    # Basic normalization and rename if close
     col_old = None
     col_desc = None
     col_new = None
@@ -292,7 +261,6 @@ def normalize_mapping(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_pcon(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
-    # Try to locate columns
     mapping = {}
     for c in df.columns:
         cl = c.strip().lower().replace(" ", "").replace("_", "")
@@ -301,13 +269,11 @@ def normalize_pcon(df: pd.DataFrame) -> pd.DataFrame:
         if cl in ["qty", "quantity", "quantities"]:
             mapping[c] = "Quantity"
     if "ARTICLE_NO" not in mapping.values():
-        # try exact
         for c in df.columns:
             if c.strip().upper() == "ARTICLE_NO":
                 mapping[c] = "ARTICLE_NO"
                 break
     if "Quantity" not in mapping.values():
-        # default quantity 1 if missing
         df["__qty__"] = 1
         mapping["__qty__"] = "Quantity"
     out = df.rename(columns=mapping)
@@ -315,14 +281,12 @@ def normalize_pcon(df: pd.DataFrame) -> pd.DataFrame:
     out = out[cols].copy()
     out.columns = ["ARTICLE_NO", "Quantity"]
     out["ARTICLE_BASE"] = out["ARTICLE_NO"].apply(base_before_dash)
-    # Coerce qty numeric
     out["Quantity"] = pd.to_numeric(out["Quantity"], errors="coerce").fillna(1).astype(int)
     return out
 
 def find_packshot_url(article_no: str, mapping_df: pd.DataFrame, master_df: pd.DataFrame) -> Optional[str]:
     if master_df is None or master_df.empty:
         return None
-    # Try with mapped New Item No.
     if mapping_df is not None and not mapping_df.empty:
         row = mapping_df[mapping_df["OLD Item-variant"].astype(str) == str(article_no)]
         if row.empty:
@@ -330,13 +294,11 @@ def find_packshot_url(article_no: str, mapping_df: pd.DataFrame, master_df: pd.D
         if not row.empty:
             new_item = row.iloc[0]["New Item No."]
             if pd.notna(new_item):
-                # find image in master by ITEM NO. or ITEM BASE
                 m = master_df[master_df["ITEM NO."].astype(str) == str(new_item)]
                 if m.empty:
                     m = master_df[master_df["ITEM BASE"].astype(str) == base_before_dash(str(new_item))]
                 if not m.empty:
                     return m.iloc[0]["IMAGE"]
-    # Fallback try with ARTICLE directly
     m = master_df[master_df["ITEM NO."].astype(str) == str(article_no)]
     if m.empty:
         m = master_df[master_df["ITEM BASE"].astype(str) == base_before_dash(str(article_no))]
@@ -377,7 +339,6 @@ def build_overview_slides(prs: Presentation, overview_layout, rendering_bytes_li
     for batch in chunk(rendering_bytes_list, MAX_OVERVIEW_IMAGES):
         slide = prs.slides.add_slide(overview_layout)
         shape_map = build_shape_map(slide)
-        # Place into Rendering1..Rendering12
         for idx, img_bytes in enumerate(batch, start=1):
             key = clean_name(f"Rendering{idx}")
             if key in shape_map and img_bytes:
@@ -393,24 +354,19 @@ def build_setting_slide(prs: Presentation,
                         master_df: pd.DataFrame):
     slide = prs.slides.add_slide(setting_layout)
     shape_map = build_shape_map(slide)
-    # Text
     if clean_name("SETTINGNAME") in shape_map:
         set_text_preserve_format(shape_map[clean_name("SETTINGNAME")], group_name)
-    # Images
     if clean_name("Rendering") in shape_map and render_bytes:
         add_picture_contain(slide, shape_map[clean_name("Rendering")], render_bytes)
     if clean_name("Linedrawing") in shape_map and floorplan_bytes:
         add_picture_contain(slide, shape_map[clean_name("Linedrawing")], floorplan_bytes)
-    # Products, up to 12
     subset = products_df.head(12).copy() if len(products_df) > 12 else products_df.copy()
     for i, row in enumerate(subset.itertuples(index=False), start=1):
-        # packshot
         pack_url = find_packshot_url(row.ARTICLE_NO, mapping_df, master_df)
         img_bytes = http_get_bytes(pack_url) if pack_url else None
         pic_key = clean_name(f"ProductPackshot{i}")
         if pic_key in shape_map and img_bytes:
             add_picture_contain(slide, shape_map[pic_key], img_bytes)
-        # description
         desc_key = clean_name(f"PRODUCT DESCRIPTION {i}")
         if desc_key in shape_map:
             desc = find_description(row.ARTICLE_NO, mapping_df)
@@ -423,9 +379,6 @@ def build_productlist_slide(prs: Presentation,
                             mapping_df: pd.DataFrame):
     slide = prs.slides.add_slide(layout)
     shape_map = build_shape_map(slide)
-    # Title
-    # The layout's title placeholder may be known as "Title" or first placeholder with text_frame
-    # If a shape named "Title" exists use that, else the first text shape.
     title_shape = shape_map.get(clean_name("Title"), None)
     if title_shape is None:
         for s in slide.shapes:
@@ -434,60 +387,46 @@ def build_productlist_slide(prs: Presentation,
                 break
     if title_shape:
         set_text_preserve_format(title_shape, f"Products – {group_name}")
-    # Table
     anchor = shape_map.get(clean_name("TableAnchor"), None)
     if not anchor:
-        # Best effort: create a table occupying center area
         class Dummy: pass
         anchor = Dummy()
         anchor.left = Inches(1.0)
         anchor.top = Inches(2.0)
         anchor.width = Inches(8.0)
         anchor.height = Inches(4.5)
-    rows = max(1, len(products_df)) + 1  # header + rows
+    rows = max(1, len(products_df)) + 1
     cols = 3
     table = add_table(slide, anchor, rows, cols)
     if table is None:
         return
-    # Headers
     table.cell(0, 0).text = "Quantity"
     table.cell(0, 1).text = "Description"
     table.cell(0, 2).text = "Article No. / New Item No."
-    # Rows
     r = 1
     for row in products_df.itertuples(index=False):
         table.cell(r, 0).text = str(int(row.Quantity))
         desc = find_description(row.ARTICLE_NO, mapping_df)
         table.cell(r, 1).text = desc
         new_item = find_new_item(row.ARTICLE_NO, mapping_df)
-        if new_item:
-            table.cell(r, 2).text = f"{row.ARTICLE_NO} / {new_item}"
-        else:
-            table.cell(r, 2).text = f"{row.ARTICLE_NO}"
+        table.cell(r, 2).text = f"{row.ARTICLE_NO} / {new_item}" if new_item else f"{row.ARTICLE_NO}"
         r += 1
 
 # -----------------------------
 # App UI
 # -----------------------------
 st.set_page_config(page_title="Muuto PowerPoint Generator", layout="centered")
-
 st.title("Muuto PowerPoint Generator")
 st.write(
-    "Upload a PowerPoint template and your files. The app builds finished slides for each group "
-    "and an overview. Use the default data sources or add your own CSV URLs."
+    "Upload dine gruppefiler (CSV + billeder). Appen henter Master Data og Mapping fra faste URL'er "
+    "og bruger en fast PowerPoint-skabelon i repoet."
 )
 
 # Session state for uploads
-if "template_bytes" not in st.session_state:
-    st.session_state.template_bytes = None
 if "uploads" not in st.session_state:
-    st.session_state.uploads = []  # list of dict: {"name":..., "bytes":...}
+    st.session_state.uploads = []
 
-st.header("Upload")
-template_file = st.file_uploader("PowerPoint template (.pptx)", type=["pptx"])
-if template_file:
-    st.session_state.template_bytes = template_file.read()
-
+# Only user group files
 files = st.file_uploader(
     "User group files (.csv, .jpg, .png). You can add multiple files.",
     type=["csv", "jpg", "jpeg", "png"],
@@ -497,15 +436,11 @@ if files:
     for f in files:
         st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
 
-master_url = st.text_input("Master Data CSV URL (optional)", "")
-mapping_url = st.text_input("Mapping CSV URL (optional)", "")
-
 # File list with remove buttons
 st.header("Files")
 if not st.session_state.uploads:
     st.info("No user group files uploaded yet.")
 else:
-    # Flat list with remove option
     to_remove = []
     for idx, f in enumerate(st.session_state.uploads):
         col1, col2 = st.columns([4, 1])
@@ -518,14 +453,9 @@ else:
         for i in sorted(to_remove, reverse=True):
             st.session_state.uploads.pop(i)
 
-# Generate button
 generate = st.button("Generate presentation")
 
-# Output placeholder
-out_area = st.empty()
-
 def build_groups(upload_list: List[Dict]) -> Dict[str, Dict]:
-    # groups[group_key] = {"name": display, "csv": bytes, "render": bytes, "floorplan": bytes}
     groups: Dict[str, Dict] = {}
     for item in upload_list:
         name = item["name"]
@@ -536,7 +466,6 @@ def build_groups(upload_list: List[Dict]) -> Dict[str, Dict]:
         if t == "csv":
             groups[key]["csv"] = b
         elif t == "render":
-            # Prefer the first render if multiple
             if groups[key]["render"] is None:
                 groups[key]["render"] = b
         elif t in ["floorplan", "linedrawing"]:
@@ -558,52 +487,43 @@ def safe_present(prs: Presentation) -> bytes:
     return bio.getvalue()
 
 if generate:
-    if not st.session_state.template_bytes:
-        st.error("Please upload a PowerPoint template.")
+    if not TEMPLATE_PATH.exists():
+        st.error("Template filen mangler i repoet: input-template.pptx")
     elif not st.session_state.uploads:
-        st.error("Please upload at least one group file.")
+        st.error("Upload mindst én gruppefil.")
     else:
         try:
             with st.spinner("Work in progress…"):
-                # Load presentation from template
-                prs = ensure_presentation(st.session_state.template_bytes)
-                # Find layouts
+                prs = ensure_presentation_from_path(TEMPLATE_PATH)
                 overview_layout = find_layout_by_name(prs, "Overview")
                 setting_layout = find_layout_by_name(prs, "Setting")
                 productlist_layout = find_layout_by_name(prs, "ProductListBlank")
-                if not overview_layout or not setting_layout or not productlist_layout:
-                    st.warning("One or more required layouts not found in the template. The app will still proceed using available layouts.")
-                # Build groups
                 groups = build_groups(st.session_state.uploads)
-                # Load master and mapping CSVs
-                master_df = load_remote_csv(master_url.strip() or DEFAULT_MASTER_URL, "Master Data")
+
+                master_df = load_remote_csv(DEFAULT_MASTER_URL)
                 master_df = normalize_master(master_df)
-                mapping_df = load_remote_csv(mapping_url.strip() or DEFAULT_MAPPING_URL, "Mapping")
+                mapping_df = load_remote_csv(DEFAULT_MAPPING_URL)
                 mapping_df = normalize_mapping(mapping_df)
-                # OVERVIEW slides
+
                 renders = collect_all_renderings(groups)
                 if overview_layout and renders:
                     build_overview_slides(prs, overview_layout, renders)
-                # For each group: Setting + ProductList
+
                 for key in sorted(groups.keys()):
                     g = groups[key]
                     group_name = g["name"]
-                    # Parse CSV
                     pcon_df = normalize_pcon(parse_csv_flex(g["csv"]) if g["csv"] else pd.DataFrame())
                     if pcon_df.empty:
-                        # Still create slides but without product data
                         pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
-                    # Setting slide
                     if setting_layout:
                         build_setting_slide(prs, setting_layout, group_name, g.get("render"), g.get("floorplan"), pcon_df, mapping_df, master_df)
-                    # ProductList slide
                     if productlist_layout:
                         build_productlist_slide(prs, productlist_layout, group_name, pcon_df, mapping_df)
 
-                # Save output
                 ppt_bytes = safe_present(prs)
                 st.success("Your presentation is ready")
                 st.download_button("Download Muuto_Settings.pptx", data=ppt_bytes, file_name=OUTPUT_NAME, mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
         except Exception:
-            # Show user-friendly message without stack trace
-            st.error("Something went wrong while generating the presentation. Check the template layouts and the input files, then try again.")
+            st.error("Noget gik galt under genereringen. Kontroller at skabelonens layouts findes, og at inputfilerne er korrekte.")
+
+
