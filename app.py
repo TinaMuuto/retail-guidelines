@@ -332,6 +332,105 @@ def chunk(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
+
+def get_blank_layout(prs: Presentation):
+    # Try a "Blank" named layout, else first layout
+    for layout in prs.slide_layouts:
+        if clean_name(layout.name) in ("blank",):
+            return layout
+    return prs.slide_layouts[0]
+
+def create_overview_slide_fallback(prs: Presentation, images_batch):
+    slide = prs.slides.add_slide(get_blank_layout(prs))
+    # Create a 3x4 grid of anchors for up to 12 images
+    cols, rows = 4, 3
+    margin_x, margin_y = Inches(0.5), Inches(1.0)
+    cell_w = Inches(2.0)
+    cell_h = Inches(1.5)
+    for idx, img_bytes in enumerate(images_batch, start=1):
+        r = (idx-1) // cols
+        c = (idx-1) % cols
+        left = margin_x + c * (cell_w + Inches(0.2))
+        top = margin_y + r * (cell_h + Inches(0.2))
+        # Add a dummy rectangle as anchor with the expected name
+        rect = slide.shapes.add_shape(1, left, top, cell_w, cell_h)  # 1 = MSO_AUTO_SHAPE_TYPE.RECTANGLE
+        rect.name = f"Rendering{idx}"
+        add_picture_contain(slide, rect, img_bytes)
+
+def create_setting_slide_fallback(prs: Presentation,
+                                  group_name: str,
+                                  render_bytes: Optional[bytes],
+                                  floorplan_bytes: Optional[bytes],
+                                  products_df: pd.DataFrame,
+                                  mapping_df: pd.DataFrame,
+                                  master_df: pd.DataFrame):
+    slide = prs.slides.add_slide(get_blank_layout(prs))
+    # Title
+    title = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(8.0), Inches(0.6))
+    title.name = "SETTINGNAME"
+    set_text_preserve_format(title, group_name)
+    # Rendering and linedrawing anchors
+    render_anchor = slide.shapes.add_shape(1, Inches(0.5), Inches(1.2), Inches(5.5), Inches(3.5))
+    render_anchor.name = "Rendering"
+    if render_bytes:
+        add_picture_contain(slide, render_anchor, render_bytes)
+
+    line_anchor = slide.shapes.add_shape(1, Inches(6.2), Inches(1.2), Inches(3.0), Inches(3.5))
+    line_anchor.name = "Linedrawing"
+    if floorplan_bytes:
+        add_picture_contain(slide, line_anchor, floorplan_bytes)
+
+    # Packshots grid 3x4 on lower half
+    start_top = Inches(5.0)
+    cell_w = Inches(1.6)
+    cell_h = Inches(1.2)
+    gap = Inches(0.2)
+    max_items = min(12, len(products_df))
+    subset = products_df.head(12).copy() if len(products_df) > 12 else products_df.copy()
+    for i, row in enumerate(subset.itertuples(index=False), start=1):
+        r = (i-1) // 6  # 2 rows of 6
+        c = (i-1) % 6
+        left = Inches(0.5) + c * (cell_w + gap)
+        top = start_top + r * (cell_h + Inches(0.6))
+        pack_anchor = slide.shapes.add_shape(1, left, top, cell_w, cell_h)
+        pack_anchor.name = f"ProductPackshot{i}"
+        pack_url = find_packshot_url(row.ARTICLE_NO, mapping_df, master_df)
+        img_bytes = http_get_bytes(pack_url) if pack_url else None
+        if img_bytes:
+            add_picture_contain(slide, pack_anchor, img_bytes)
+        # Description below each packshot
+        desc_box = slide.shapes.add_textbox(left, top + cell_h + Inches(0.05), cell_w, Inches(0.4))
+        desc_box.name = f"PRODUCT DESCRIPTION {i}"
+        set_text_preserve_format(desc_box, find_description(row.ARTICLE_NO, mapping_df))
+
+def create_productlist_slide_fallback(prs: Presentation,
+                                      group_name: str,
+                                      products_df: pd.DataFrame,
+                                      mapping_df: pd.DataFrame):
+    slide = prs.slides.add_slide(get_blank_layout(prs))
+    # Title
+    title = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9.0), Inches(0.6))
+    set_text_preserve_format(title, f"Products – {group_name}")
+    # Table anchor area
+    anchor = slide.shapes.add_shape(1, Inches(0.5), Inches(1.2), Inches(9.0), Inches(5.0))
+    anchor.name = "TableAnchor"
+    rows = max(1, len(products_df)) + 1
+    cols = 3
+    table = add_table(slide, anchor, rows, cols)
+    if table is None:
+        return
+    table.cell(0, 0).text = "Quantity"
+    table.cell(0, 1).text = "Description"
+    table.cell(0, 2).text = "Article No. / New Item No."
+    r = 1
+    for row in products_df.itertuples(index=False):
+        table.cell(r, 0).text = str(int(row.Quantity))
+        desc = find_description(row.ARTICLE_NO, mapping_df)
+        table.cell(r, 1).text = desc
+        new_item = find_new_item(row.ARTICLE_NO, mapping_df)
+        table.cell(r, 2).text = f"{row.ARTICLE_NO} / {new_item}" if new_item else f"{row.ARTICLE_NO}"
+        r += 1
+
 # -----------------------------
 # Slide builders
 # -----------------------------
@@ -438,25 +537,6 @@ if files:
             st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
             existing_names.add(f.name)
 
-# Single flat list with sizes and remove buttons
-st.subheader("Files")
-if not st.session_state.uploads:
-    st.info("No user group files uploaded yet.")
-else:
-    to_remove = []
-    for idx, f in enumerate(st.session_state.uploads):
-        size_kb = f"{len(f['bytes'])/1024:.1f}KB"
-        col1, col2, col3 = st.columns([6, 2, 1])
-        with col1:
-            st.caption(f["name"])
-        with col2:
-            st.caption(size_kb)
-        with col3:
-            if st.button("❌", key=f"rm_{idx}"):
-                to_remove.append(idx)
-    if to_remove:
-        for i in sorted(to_remove, reverse=True):
-            st.session_state.uploads.pop(i)
 
 
 # Generate button
@@ -482,8 +562,12 @@ if generate:
                 mapping_df = normalize_mapping(mapping_df)
 
                 renders = collect_all_renderings(groups)
-                if overview_layout and renders:
-                    build_overview_slides(prs, overview_layout, renders)
+                if renders:
+    if overview_layout:
+        build_overview_slides(prs, overview_layout, renders)
+    else:
+        for batch in chunk(renders, MAX_OVERVIEW_IMAGES):
+            create_overview_slide_fallback(prs, batch)
 
                 for key in sorted(groups.keys()):
                     g = groups[key]
@@ -493,8 +577,12 @@ if generate:
                         pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
                     if setting_layout:
                         build_setting_slide(prs, setting_layout, group_name, g.get("render"), g.get("floorplan"), pcon_df, mapping_df, master_df)
+                    else:
+                        create_setting_slide_fallback(prs, group_name, g.get("render"), g.get("floorplan"), pcon_df, mapping_df, master_df)
                     if productlist_layout:
                         build_productlist_slide(prs, productlist_layout, group_name, pcon_df, mapping_df)
+                    else:
+                        create_productlist_slide_fallback(prs, group_name, pcon_df, mapping_df)
 
                 ppt_bytes = safe_present(prs)
                 st.success("Your presentation is ready")
