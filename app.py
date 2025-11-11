@@ -157,4 +157,561 @@ def normalize_master(df: pd.DataFrame) -> pd.DataFrame:
             img_col = c
             break
     if img_col is None:
-        for c in df.co
+        for c in df.columns:
+            if "image" in c.lower() and ("url" in c.lower() or "download" in c.lower()):
+                img_col = c
+                break
+    item_col = None
+    for c in df.columns:
+        if c.strip().upper() == "ITEM NO.":
+            item_col = c
+            break
+    if item_col is None:
+        for c in df.columns:
+            if "item" in c.lower() and "no" in c.lower():
+                item_col = c
+                break
+    if item_col is None or img_col is None:
+        return pd.DataFrame(columns=["ITEM NO.", "IMAGE"])
+    out = df[[item_col, img_col]].copy()
+    out.columns = ["ITEM NO.", "IMAGE"]
+    out["ITEM BASE"] = out["ITEM NO."].apply(base_before_dash)
+    return out
+
+def normalize_mapping(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["OLD Item-variant", "Description", "New Item No."])
+    cols = {c: c.strip() for c in df.columns}
+    df = df.rename(columns=cols)
+    col_old = None
+    col_desc = None
+    col_new = None
+    for c in df.columns:
+        if c.lower().strip() in ["old item-variant", "old item variant", "olditem-variant"]:
+            col_old = c
+        if c.lower().strip() == "description":
+            col_desc = c
+        if c.lower().strip() in ["new item no.", "new item no", "new item number"]:
+            col_new = c
+    if col_old is None:
+        for c in df.columns:
+            if "old" in c.lower() and "variant" in c.lower():
+                col_old = c; break
+    if col_new is None:
+        for c in df.columns:
+            if "new" in c.lower() and ("no" in c.lower() or "number" in c.lower()):
+                col_new = c; break
+    if col_desc is None:
+        for c in df.columns:
+            if "desc" in c.lower():
+                col_desc = c; break
+    if not col_old or not col_new:
+        return pd.DataFrame(columns=["OLD Item-variant", "Description", "New Item No."])
+    if col_desc is None:
+        df["__desc__"] = ""
+        col_desc = "__desc__"
+    out = df[[col_old, col_desc, col_new]].copy()
+    out.columns = ["OLD Item-variant", "Description", "New Item No."]
+    out["OLD BASE"] = out["OLD Item-variant"].apply(base_before_dash)
+    out["NEW BASE"] = out["New Item No."].apply(base_before_dash)
+    return out
+
+def normalize_pcon(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
+    norm = {c: re.sub(r"[^a-z0-9]", "", c.lower()) for c in df.columns}
+    article_col = None
+    for c in df.columns:
+        key = norm[c]
+        if (key in {"articleno","article","articlenumber","artno","artnr","artnumber","itemno","itemnumber","articlecode"}
+            or ("article" in key and "no" in key) or ("item" in key and "no" in key)):
+            article_col = c
+            break
+    qty_col = None
+    for c in df.columns:
+        key = norm[c]
+        if key in {"qty","quantity","quantities","qtytotal","qtysum"} or "qty" in key:
+            qty_col = c
+            break
+    if article_col is None:
+        return pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
+    out = pd.DataFrame()
+    out["ARTICLE_NO"] = df[article_col].astype(str).fillna("")
+    if qty_col is not None:
+        out["Quantity"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(1).astype(int)
+    else:
+        out["Quantity"] = 1
+    out["ARTICLE_BASE"] = out["ARTICLE_NO"].apply(base_before_dash)
+    return out[["ARTICLE_NO", "Quantity", "ARTICLE_BASE"]]
+
+def find_packshot_url(article_no: str, mapping_df: pd.DataFrame, master_df: pd.DataFrame) -> Optional[str]:
+    if master_df is None or master_df.empty:
+        return None
+    if mapping_df is not None and not mapping_df.empty:
+        row = mapping_df[mapping_df["OLD Item-variant"].astype(str) == str(article_no)]
+        if row.empty:
+            row = mapping_df[mapping_df["OLD BASE"].astype(str) == base_before_dash(article_no)]
+        if not row.empty:
+            new_item = row.iloc[0]["New Item No."]
+            if pd.notna(new_item):
+                m = master_df[master_df["ITEM NO."].astype(str) == str(new_item)]
+                if m.empty:
+                    m = master_df[master_df["ITEM BASE"].astype(str) == base_before_dash(str(new_item))]
+                if not m.empty:
+                    return m.iloc[0]["IMAGE"]
+    m = master_df[master_df["ITEM NO."].astype(str) == str(article_no)]
+    if m.empty:
+        m = master_df[master_df["ITEM BASE"].astype(str) == base_before_dash(str(article_no))]
+    if not m.empty:
+        return m.iloc[0]["IMAGE"]
+    return None
+
+def find_description(article_no: str, mapping_df: pd.DataFrame) -> str:
+    if mapping_df is None or mapping_df.empty:
+        return ""
+    row = mapping_df[mapping_df["OLD Item-variant"].astype(str) == str(article_no)]
+    if row.empty:
+        row = mapping_df[mapping_df["OLD BASE"].astype(str) == base_before_dash(article_no)]
+    if not row.empty:
+        desc = row.iloc[0]["Description"]
+        return "" if pd.isna(desc) else str(desc)
+    return ""
+
+def find_new_item(article_no: str, mapping_df: pd.DataFrame) -> Optional[str]:
+    if mapping_df is None or mapping_df.empty:
+        return None
+    row = mapping_df[mapping_df["OLD Item-variant"].astype(str) == str(article_no)]
+    if row.empty:
+        row = mapping_df[mapping_df["OLD BASE"].astype(str) == base_before_dash(article_no)]
+    if not row.empty:
+        val = row.iloc[0]["New Item No."]
+        return None if pd.isna(val) else str(val)
+    return None
+
+def chunk(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+def get_blank_layout(prs: Presentation):
+    for layout in prs.slide_layouts:
+        if clean_name(layout.name) in ("blank", "empty"):
+            return layout
+    return prs.slide_layouts[0]
+
+# --------- NEW: inherit layout names to slide ----------
+def inherit_layout_names(slide):
+    """Copy placeholder-based names from layout shapes to newly created slide shapes."""
+    try:
+        layout = slide.slide_layout
+        lnames = {}
+        for sh in getattr(layout, "shapes", []):
+            phf = getattr(sh, "placeholder_format", None)
+            if phf is not None:
+                idx = getattr(phf, "idx", None)
+                nm = getattr(sh, "name", None)
+                if idx is not None and nm:
+                    lnames[idx] = nm
+        for sh in slide.shapes:
+            phf = getattr(sh, "placeholder_format", None)
+            if phf is not None and getattr(phf, "idx", None) in lnames:
+                if not getattr(sh, "name", "") or "placeholder" in sh.name.lower():
+                    sh.name = lnames[phf.idx]
+    except Exception:
+        pass
+
+# --------- Image helpers ----------
+def add_picture_contain(slide, shape, image_bytes: bytes):
+    try:
+        if not image_bytes:
+            return
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            max_dim = min(MAX_IMAGE_PX, max(w, h))
+            scale_src_cap = min(1.0, max_dim / float(max(w, h)))
+            if scale_src_cap < 1.0:
+                im = im.resize((int(w * scale_src_cap), int(h * scale_src_cap)), Image.LANCZOS)
+
+            frame_w = int(shape.width)
+            frame_h = int(shape.height)
+            s = min(frame_w / im.width, frame_h / im.height)
+            s = min(s, 1.0)
+            target_w = max(1, int(im.width * s))
+            target_h = max(1, int(im.height * s))
+
+            buf = io.BytesIO()
+            im.resize((target_w, target_h), Image.LANCZOS).save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+            buf.seek(0)
+
+            left = shape.left + int((shape.width - target_w) / 2)
+            top = shape.top + int((shape.height - target_h) / 2)
+            slide.shapes.add_picture(buf, left, top, width=target_w, height=target_h)
+    except Exception:
+        return
+
+def add_picture_into_shape(slide, shape, image_bytes: bytes):
+    """Insert into real placeholders via insert_picture; else fall back to contain-fit."""
+    if not image_bytes or shape is None:
+        return
+    phf = getattr(shape, "placeholder_format", None)
+    if phf is not None:
+        try:
+            if getattr(phf, "type", None) in (PP_PLACEHOLDER.PICTURE, PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT):
+                shape.insert_picture(io.BytesIO(image_bytes))
+                return
+        except Exception:
+            pass
+    add_picture_contain(slide, shape, image_bytes)
+
+def add_table(slide, anchor_shape, rows: int, cols: int):
+    try:
+        table = slide.shapes.add_table(rows, cols, anchor_shape.left, anchor_shape.top, anchor_shape.width, anchor_shape.height).table
+        return table
+    except Exception:
+        return None
+
+# --------- Fallback slide builders ----------
+def create_overview_slide_fallback(prs: Presentation, images_batch):
+    slide = prs.slides.add_slide(get_blank_layout(prs))
+    inherit_layout_names(slide)
+    cols, rows = 4, 3
+    margin_x, margin_y = Inches(0.5), Inches(1.0)
+    cell_w = Inches(2.0)
+    cell_h = Inches(1.5)
+    for idx, img_bytes in enumerate(images_batch, start=1):
+        r = (idx-1) // cols
+        c = (idx-1) % cols
+        left = margin_x + c * (cell_w + Inches(0.2))
+        top = margin_y + r * (cell_h + Inches(0.2))
+        rect = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, left, top, cell_w, cell_h)
+        rect.name = f"Rendering{idx}"
+        add_picture_contain(slide, rect, img_bytes)
+
+def create_setting_slide_fallback(prs: Presentation,
+                                  group_name: str,
+                                  render_bytes: Optional[bytes],
+                                  floorplan_bytes: Optional[bytes],
+                                  products_df: pd.DataFrame,
+                                  mapping_df: pd.DataFrame,
+                                  master_df: pd.DataFrame):
+    slide = prs.slides.add_slide(get_blank_layout(prs))
+    inherit_layout_names(slide)
+    title = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(8.0), Inches(0.6))
+    title.name = "SETTINGNAME"
+    set_text_preserve_format(title, group_name)
+
+    render_anchor = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0.5), Inches(1.2), Inches(5.5), Inches(3.5))
+    render_anchor.name = "Rendering"
+    if render_bytes:
+        add_picture_contain(slide, render_anchor, render_bytes)
+
+    line_anchor = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(6.2), Inches(1.2), Inches(3.0), Inches(3.5))
+    line_anchor.name = "Linedrawing"
+    if floorplan_bytes:
+        add_picture_contain(slide, line_anchor, floorplan_bytes)
+
+    start_top = Inches(5.0)
+    cell_w = Inches(1.6)
+    cell_h = Inches(1.2)
+    gap = Inches(0.2)
+    subset = products_df.head(12).copy() if len(products_df) > 12 else products_df.copy()
+    for i, row in enumerate(subset.itertuples(index=False), start=1):
+        r = (i-1) // 6
+        c = (i-1) % 6
+        left = Inches(0.5) + c * (cell_w + gap)
+        top = start_top + r * (cell_h + Inches(0.6))
+        pack_anchor = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, left, top, cell_w, cell_h)
+        pack_anchor.name = f"ProductPackshot{i}"
+        pack_url = find_packshot_url(row.ARTICLE_NO, mapping_df, master_df)
+        img_bytes = http_get_bytes(pack_url) if pack_url else None
+        if img_bytes:
+            add_picture_contain(slide, pack_anchor, img_bytes)
+        desc_box = slide.shapes.add_textbox(left, top + cell_h + Inches(0.05), cell_w, Inches(0.4))
+        desc_box.name = f"PRODUCT DESCRIPTION {i}"
+        set_text_preserve_format(desc_box, find_description(row.ARTICLE_NO, mapping_df))
+
+def create_productlist_slide_fallback(prs: Presentation,
+                                      group_name: str,
+                                      products_df: pd.DataFrame,
+                                      mapping_df: pd.DataFrame):
+    slide = prs.slides.add_slide(get_blank_layout(prs))
+    inherit_layout_names(slide)
+    title = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9.0), Inches(0.6))
+    set_text_preserve_format(title, f"Products – {group_name}")
+    anchor = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0.5), Inches(1.2), Inches(9.0), Inches(5.0))
+    anchor.name = "TableAnchor"
+    rows = max(1, len(products_df)) + 1
+    cols = 3
+    table = add_table(slide, anchor, rows, cols)
+    if table is None:
+        return
+    table.cell(0, 0).text = "Quantity"
+    table.cell(0, 1).text = "Description"
+    table.cell(0, 2).text = "Article No. / New Item No."
+    r = 1
+    for row in products_df.itertuples(index=False):
+        table.cell(r, 0).text = str(int(row.Quantity))
+        desc = find_description(row.ARTICLE_NO, mapping_df)
+        table.cell(r, 1).text = desc
+        new_item = find_new_item(row.ARTICLE_NO, mapping_df)
+        table.cell(r, 2).text = f"{row.ARTICLE_NO} / {new_item}" if new_item else f"{row.ARTICLE_NO}"
+        r += 1
+
+# --------- Main slide builders ----------
+def build_overview_slides(prs: Presentation, overview_layout, rendering_bytes_list: List[bytes]):
+    for batch in chunk(rendering_bytes_list, MAX_OVERVIEW_IMAGES):
+        slide = prs.slides.add_slide(overview_layout)
+        inherit_layout_names(slide)
+        shape_map = build_shape_map(slide)
+        candidates = []
+        for key, shapes in shape_map.items():
+            if key.startswith("rendering"):
+                for sh in shapes:
+                    candidates.append((int(sh.top), int(sh.left), sh))
+        candidates.sort(key=lambda t: (t[0], t[1]))
+        if candidates:
+            for (img_bytes, (_, __, target_shape)) in zip(batch, candidates):
+                if img_bytes:
+                    add_picture_into_shape(slide, target_shape, img_bytes)
+        else:
+            # Named placeholders Rendering1..Rendering12
+            for idx, img_bytes in enumerate(batch, start=1):
+                key = clean_name(f"Rendering{idx}")
+                if key in shape_map:
+                    add_picture_into_shape(slide, shape_map[key][0], img_bytes)
+
+def build_setting_slide(prs: Presentation,
+                        setting_layout,
+                        group_name: str,
+                        render_bytes: Optional[bytes],
+                        floorplan_bytes: Optional[bytes],
+                        products_df: pd.DataFrame,
+                        mapping_df: pd.DataFrame,
+                        master_df: pd.DataFrame):
+    slide = prs.slides.add_slide(setting_layout)
+    inherit_layout_names(slide)
+    shape_map = build_shape_map(slide)
+    # title
+    if clean_name("SETTINGNAME") in shape_map:
+        for sh in shape_map[clean_name("SETTINGNAME")]:
+            set_text_preserve_format(sh, group_name)
+    # images
+    if clean_name("Rendering") in shape_map and render_bytes:
+        add_picture_into_shape(slide, shape_map[clean_name("Rendering")][0], render_bytes)
+    if clean_name("Linedrawing") in shape_map and floorplan_bytes:
+        add_picture_into_shape(slide, shape_map[clean_name("Linedrawing")][0], floorplan_bytes)
+    # products
+    subset = products_df.head(12).copy() if len(products_df) > 12 else products_df.copy()
+    for i, row in enumerate(subset.itertuples(index=False), start=1):
+        pack_url = find_packshot_url(row.ARTICLE_NO, mapping_df, master_df)
+        img_bytes = http_get_bytes(pack_url) if pack_url else None
+        pic_key = clean_name(f"ProductPackshot{i}")
+        if pic_key in shape_map and img_bytes:
+            add_picture_into_shape(slide, shape_map[pic_key][0], img_bytes)
+        desc_key = clean_name(f"PRODUCT DESCRIPTION {i}")
+        if desc_key in shape_map:
+            desc = find_description(row.ARTICLE_NO, mapping_df)
+            set_text_preserve_format(shape_map[desc_key][0], desc)
+
+def build_productlist_slide(prs: Presentation,
+                            layout,
+                            group_name: str,
+                            products_df: pd.DataFrame,
+                            mapping_df: pd.DataFrame):
+    slide = prs.slides.add_slide(layout)
+    inherit_layout_names(slide)
+    shape_map = build_shape_map(slide)
+    title_shapes = shape_map.get(clean_name("Title"), None)
+    title_shape = title_shapes[0] if title_shapes else None
+    if title_shape:
+        set_text_preserve_format(title_shape, f"Products – {group_name}")
+    anchors = shape_map.get(clean_name("TableAnchor"), None)
+    anchor = anchors[0] if anchors else None
+    if not anchor:
+        class Dummy: pass
+        anchor = Dummy()
+        anchor.left = Inches(1.0)
+        anchor.top = Inches(2.0)
+        anchor.width = Inches(8.0)
+        anchor.height = Inches(4.5)
+    rows = max(1, len(products_df)) + 1
+    cols = 3
+    table = add_table(slide, anchor, rows, cols)
+    if table is None:
+        return
+    table.cell(0, 0).text = "Quantity"
+    table.cell(0, 1).text = "Description"
+    table.cell(0, 2).text = "Article No. / New Item No."
+    r = 1
+    for row in products_df.itertuples(index=False):
+        table.cell(r, 0).text = str(int(row.Quantity))
+        desc = find_description(row.ARTICLE_NO, mapping_df)
+        table.cell(r, 1).text = desc
+        new_item = find_new_item(row.ARTICLE_NO, mapping_df)
+        table.cell(r, 2).text = f"{row.ARTICLE_NO} / {new_item}" if new_item else f"{row.ARTICLE_NO}"
+        r += 1
+
+def layout_has_expected(layout, keys: List[str]) -> bool:
+    try:
+        names = [clean_name(getattr(sh, "name", "")) for sh in layout.shapes]
+    except Exception:
+        names = []
+    for k in keys:
+        if clean_name(k) in names:
+            return True
+    if any(n.startswith("rendering") for n in names):
+        return True
+    return False
+
+def preflight_checks() -> Dict[str, str]:
+    results = {}
+    try:
+        if not TEMPLATE_PATH.exists():
+            results["template"] = "Template not found (input-template.pptx)."
+        else:
+            _ = Presentation(str(TEMPLATE_PATH))
+            results["template"] = "OK"
+    except Exception:
+        results["template"] = "Template unreadable or not a valid .pptx."
+    try:
+        m = http_get_bytes(DEFAULT_MASTER_URL)
+        results["master_csv"] = "OK" if m else "Unavailable"
+    except Exception:
+        results["master_csv"] = "Unavailable"
+    try:
+        mp = http_get_bytes(DEFAULT_MAPPING_URL)
+        results["mapping_csv"] = "OK" if mp else "Unavailable"
+    except Exception:
+        results["mapping_csv"] = "Unavailable"
+    return results
+
+def build_groups(upload_list: List[Dict]) -> Dict[str, Dict]:
+    groups: Dict[str, Dict] = {}
+    for item in upload_list:
+        name = item["name"]
+        b = item["bytes"]
+        key, t = group_key_from_filename(name)
+        if key not in groups:
+            groups[key] = {"name": key, "csv": None, "render": None, "floorplan": None}
+        if t == "csv":
+            groups[key]["csv"] = b
+        elif t == "render":
+            if groups[key]["render"] is None:
+                groups[key]["render"] = b
+        elif t in ["floorplan", "linedrawing"]:
+            if groups[key]["floorplan"] is None:
+                groups[key]["floorplan"] = b
+    return groups
+
+def collect_all_renderings(groups: Dict[str, Dict]) -> List[bytes]:
+    return [g["render"] for g in groups.values() if g.get("render")]
+
+def safe_present(prs: Presentation) -> bytes:
+    bio = io.BytesIO()
+    prs.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+# ---------------------- UI ----------------------
+st.set_page_config(page_title="Muuto PowerPoint Generator", layout="centered")
+st.title("Muuto PowerPoint Generator")
+st.write("Upload your group files (CSV and images). The app uses the fixed PowerPoint template in the repository and fetches Master Data and Mapping from fixed URLs.")
+
+if "uploads" not in st.session_state:
+    st.session_state.uploads = []
+
+files = st.file_uploader(
+    "User group files (.csv, .jpg, .png). You can add multiple files.",
+    type=["csv", "jpg", "jpeg", "png"],
+    accept_multiple_files=True,
+)
+
+if files:
+    existing = {u["name"] for u in st.session_state.uploads}
+    for f in files:
+        if f.name not in existing:
+            st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
+            existing.add(f.name)
+
+# Single flat file list with remove buttons
+if st.session_state.uploads:
+    st.subheader("Uploaded files")
+    remove_indices = []
+    for idx, item in enumerate(st.session_state.uploads):
+        col1, col2 = st.columns([0.9, 0.1])
+        with col1:
+            size_kb = len(item["bytes"]) / 1024.0
+            st.write(f"{item['name']}  —  {size_kb:.1f}KB")
+        with col2:
+            if st.button("❌", key=f"rm_{idx}"):
+                remove_indices.append(idx)
+    if remove_indices:
+        for i in sorted(remove_indices, reverse=True):
+            del st.session_state.uploads[i]
+        st.experimental_rerun()
+
+generate = st.button("Generate presentation")
+
+# ---------------------- Orchestration ----------------------
+if generate:
+    with st.spinner("Work in progress…"):
+        diag = preflight_checks()
+        if diag.get("template") != "OK":
+            st.error("Template issue: " + diag.get("template", "Unknown"))
+        elif not TEMPLATE_PATH.exists():
+            st.error("Template file is missing in the repository: input-template.pptx")
+        elif not st.session_state.uploads:
+            st.error("Please upload at least one group file.")
+        else:
+            try:
+                prs = ensure_presentation_from_path(TEMPLATE_PATH)
+
+                overview_layout = find_layout_by_name(prs, "Overview") or find_layout_by_name(prs, "Renderings")
+                setting_layout = find_layout_by_name(prs, "Setting")
+                productlist_layout = find_layout_by_name(prs, "ProductListBlank")
+
+                groups = build_groups(st.session_state.uploads)
+
+                master_df = normalize_master(load_remote_csv(DEFAULT_MASTER_URL))
+                mapping_df = normalize_mapping(load_remote_csv(DEFAULT_MAPPING_URL))
+
+                # Overview
+                renders = collect_all_renderings(groups)
+                if renders:
+                    if overview_layout and layout_has_expected(overview_layout, ["Rendering"]):
+                        build_overview_slides(prs, overview_layout, renders)
+                    else:
+                        for batch in chunk(renders, MAX_OVERVIEW_IMAGES):
+                            create_overview_slide_fallback(prs, batch)
+
+                # Per group
+                for key in sorted(groups.keys()):
+                    g = groups[key]
+                    group_name = g["name"]
+                    try:
+                        pcon_df = normalize_pcon(parse_csv_flex(g["csv"]) if g["csv"] else pd.DataFrame())
+                    except Exception:
+                        pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
+                    if pcon_df.empty:
+                        pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
+
+                    if setting_layout and layout_has_expected(setting_layout, ["SETTINGNAME", "Rendering", "ProductPackshot1"]):
+                        build_setting_slide(prs, setting_layout, group_name, g.get("render"), g.get("floorplan"), pcon_df, mapping_df, master_df)
+                    else:
+                        create_setting_slide_fallback(prs, group_name, g.get("render"), g.get("floorplan"), pcon_df, mapping_df, master_df)
+
+                    if productlist_layout and layout_has_expected(productlist_layout, ["TableAnchor"]):
+                        build_productlist_slide(prs, productlist_layout, group_name, pcon_df, mapping_df)
+                    else:
+                        create_productlist_slide_fallback(prs, group_name, pcon_df, mapping_df)
+
+                ppt_bytes = safe_present(prs)
+                st.success("Your presentation is ready")
+                st.download_button(
+                    "Download Muuto_Settings.pptx",
+                    data=ppt_bytes,
+                    file_name=OUTPUT_NAME,
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                )
+            except Exception:
+                st.error("Something went wrong while generating the presentation. Check the template and inputs, then try again.")
