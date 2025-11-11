@@ -76,6 +76,20 @@ def safe_find_shape(shape_map: Dict[str, list], key: str, index: int = 0) -> Opt
     clean_key = clean_name(key)
     if clean_key in shape_map and len(shape_map[clean_key]) > index:
         return shape_map[clean_key][index]
+    
+    # Try alternate names if the primary key fails (for flexibility with user's template names)
+    if clean_key.startswith("productpackshot"):
+        # If 'productpackshotX' failed, try 'packshotX' (common user simplification)
+        alt_key = clean_key.replace("productpackshot", "packshot")
+        if alt_key in shape_map and len(shape_map[alt_key]) > index:
+            return shape_map[alt_key][index]
+            
+    # Specific check for Linedrawing typo found in user's template (LlineDrawing)
+    if clean_key == "linedrawing":
+        alt_key = "llinedrawing"
+        if alt_key in shape_map and len(shape_map[alt_key]) > index:
+            return shape_map[alt_key][index]
+            
     return None
 
 def http_get_bytes(url: str) -> Optional[bytes]:
@@ -127,11 +141,14 @@ def group_key_from_filename(name: str) -> Tuple[str, str]:
             t = "render"
         else:
             t = "other"
+    # Find the key by taking everything AFTER the first " - "
     if " - " in base:
         key = base.split(" - ", 1)[1]
+    # Fallback: find the key by taking the last part split by [- _]
     else:
         parts = re.split(r"[-_]", base)
         key = parts[-1] if parts else base
+    # Clean up the key by removing type markers (case-insensitive)
     key = re.sub(r"\s+(floorplan|line\s*drawing|linedrawing)$", "", key, flags=re.IGNORECASE).strip()
     return key, t
 
@@ -539,7 +556,8 @@ def build_setting_slide(prs: Presentation,
     if render_shape and render_bytes:
         add_picture_into_shape(slide, render_shape, render_bytes)
         
-    floorplan_shape = safe_find_shape(shape_map, "Linedrawing")
+    # Linedrawing check: safe_find_shape now handles the 'LlineDrawing' typo from your template
+    floorplan_shape = safe_find_shape(shape_map, "Linedrawing") 
     if floorplan_shape and floorplan_bytes:
         add_picture_into_shape(slide, floorplan_shape, floorplan_bytes)
         
@@ -550,7 +568,7 @@ def build_setting_slide(prs: Presentation,
         pack_url = find_packshot_url(article_no, mapping_df, master_df)
         img_bytes = http_get_bytes(pack_url) if pack_url else None
         
-        # a) Packshot image
+        # a) Packshot image (safe_find_shape handles the PackshotX vs ProductPackshotX flexibility)
         pic_key = clean_name(f"ProductPackshot{i}")
         pic_shape = safe_find_shape(shape_map, pic_key)
         
@@ -626,7 +644,7 @@ def layout_has_expected(layout, keys: List[str]) -> bool:
         
     # Specific check for Setting Layout: Checks if it contains Rendering OR Packshot1
     if clean_name(layout.name) == clean_name("Setting"):
-        if any(n.startswith("productpackshot") for n in names) or clean_name("Rendering") in names:
+        if any(n.startswith("productpackshot") for n in names) or any(n.startswith("packshot") for n in names) or clean_name("Rendering") in names:
             return True
             
     return False
@@ -704,6 +722,14 @@ files = st.file_uploader(
     accept_multiple_files=True,
 )
 
+if files:
+    existing = {u["name"] for u in st.session_state.uploads}
+    for f in files:
+        # Check if file is already loaded to avoid reading heavy file multiple times
+        if f.name not in existing:
+            st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
+            existing.add(f.name)
+
 # Single flat file list with remove buttons
 if st.session_state.uploads:
     st.subheader("Uploaded Files")
@@ -731,78 +757,82 @@ if generate:
             st.error("Template issue: " + diag.get("template", "Unknown"))
         elif not TEMPLATE_PATH.exists():
             st.error("Template file is missing in the repository: input-template.pptx")
-        elif not st.session_state.uploads:
-            st.error("Please upload at least one group file.")
         else:
             try:
-                prs = ensure_presentation_from_path(TEMPLATE_PATH)
-
-                overview_layout = find_layout_by_name(prs, "Overview") or find_layout_by_name(prs, "Renderings")
-                setting_layout = find_layout_by_name(prs, "Setting")
-                productlist_layout = find_layout_by_name(prs, "ProductListBlank")
-
+                # Build groups regardless of whether st.session_state.uploads is empty
                 groups = build_groups(st.session_state.uploads)
 
-                master_df = normalize_master(load_remote_csv(DEFAULT_MASTER_URL))
-                mapping_df = normalize_mapping(load_remote_csv(DEFAULT_MAPPING_URL))
-                
-                # Save data status for UI feedback
-                st.session_state.last_master_df = master_df
-                st.session_state.last_mapping_df = mapping_df
-                
-                # Check for empty Master/Mapping data
-                if master_df.empty:
-                     st.warning("WARNING: Master Data (Image URLs) could not be loaded. Packshots will be missing.")
-                if mapping_df.empty:
-                     st.warning("WARNING: Mapping Data (Descriptions/New Article Numbers) could not be loaded. Descriptions and new article numbers will be missing.")
-                
-
-                # Overview Slides
-                renders = collect_all_renderings(groups)
-                if renders:
-                    if overview_layout and layout_has_expected(overview_layout, ["Rendering1"]):
-                        build_overview_slides(prs, overview_layout, renders)
-                    else:
-                        for batch in chunk(renders, MAX_OVERVIEW_IMAGES):
-                            create_overview_slide_fallback(prs, batch)
-
-                # Per group Slides
-                for key in sorted(groups.keys()):
-                    g = groups[key]
-                    group_name = g["name"]
+                if not groups:
+                    st.error("Could not form any groups. Please ensure files are uploaded and filenames contain CSV and at least one image/floorplan.")
                     
-                    try:
-                        pcon_df = normalize_pcon(parse_csv_flex(g["csv"]) if g["csv"] else pd.DataFrame())
-                    except Exception:
-                        pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
+                # Continue only if groups were successfully formed
+                if groups:
+                    prs = ensure_presentation_from_path(TEMPLATE_PATH)
+
+                    overview_layout = find_layout_by_name(prs, "Overview") or find_layout_by_name(prs, "Renderings")
+                    setting_layout = find_layout_by_name(prs, "Setting")
+                    productlist_layout = find_layout_by_name(prs, "ProductListBlank")
+
+                    master_df = normalize_master(load_remote_csv(DEFAULT_MASTER_URL))
+                    mapping_df = normalize_mapping(load_remote_csv(DEFAULT_MAPPING_URL))
                     
-                    if pcon_df.empty:
-                        pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
-                        st.warning(f"WARNING: Could not load product data from CSV for group '{group_name}'.")
+                    # Save data status for UI feedback
+                    st.session_state.last_master_df = master_df
+                    st.session_state.last_mapping_df = mapping_df
+                    
+                    # Check for empty Master/Mapping data
+                    if master_df.empty:
+                         st.warning("WARNING: Master Data (Image URLs) could not be loaded. Packshots will be missing.")
+                    if mapping_df.empty:
+                         st.warning("WARNING: Mapping Data (Descriptions/New Article Numbers) could not be loaded. Descriptions and new article numbers will be missing.")
+                    
 
-                    # Setting Slide (Renders, Linedrawing, Packshots, Descriptions)
-                    if setting_layout and layout_has_expected(setting_layout, ["SETTINGNAME", "Rendering", "ProductPackshot1"]):
-                        build_setting_slide(prs, setting_layout, group_name, g.get("render"), g.get("floorplan"), pcon_df, mapping_df, master_df)
-                    else:
-                        create_setting_slide_fallback(prs, group_name, g.get("render"), g.get("floorplan"), pcon_df, mapping_df, master_df)
-                        st.info(f"INFO: Setting slide for '{group_name}' used fallback layout (Check placeholder names: SETTINGNAME, Rendering, ProductPackshot1-12).")
+                    # Overview Slides
+                    renders = collect_all_renderings(groups)
+                    if renders:
+                        if overview_layout and layout_has_expected(overview_layout, ["Rendering1"]):
+                            build_overview_slides(prs, overview_layout, renders)
+                        else:
+                            for batch in chunk(renders, MAX_OVERVIEW_IMAGES):
+                                create_overview_slide_fallback(prs, batch)
+
+                    # Per group Slides
+                    for key in sorted(groups.keys()):
+                        g = groups[key]
+                        group_name = g["name"]
+                        
+                        try:
+                            pcon_df = normalize_pcon(parse_csv_flex(g["csv"]) if g["csv"] else pd.DataFrame())
+                        except Exception:
+                            pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
+                        
+                        if pcon_df.empty:
+                            pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
+                            st.warning(f"WARNING: Could not load product data from CSV for group '{group_name}'.")
+
+                        # Setting Slide (Renders, Linedrawing, Packshots, Descriptions)
+                        if setting_layout and layout_has_expected(setting_layout, ["SETTINGNAME", "Rendering", "ProductPackshot1"]):
+                            build_setting_slide(prs, setting_layout, group_name, g.get("render"), g.get("floorplan"), pcon_df, mapping_df, master_df)
+                        else:
+                            create_setting_slide_fallback(prs, group_name, g.get("render"), g.get("floorplan"), pcon_df, mapping_df, master_df)
+                            st.info(f"INFO: Setting slide for '{group_name}' used fallback layout (Check placeholder names: SETTINGNAME, Rendering, ProductPackshot1-12).")
 
 
-                    # Product List Slide (Table)
-                    if productlist_layout and layout_has_expected(productlist_layout, ["TableAnchor"]):
-                        build_productlist_slide(prs, productlist_layout, group_name, pcon_df, mapping_df)
-                    else:
-                        create_productlist_slide_fallback(prs, group_name, pcon_df, mapping_df)
-                        st.info(f"INFO: Product List slide for '{group_name}' used fallback layout (Check name 'TableAnchor').")
+                        # Product List Slide (Table)
+                        if productlist_layout and layout_has_expected(productlist_layout, ["TableAnchor"]):
+                            build_productlist_slide(prs, productlist_layout, group_name, pcon_df, mapping_df)
+                        else:
+                            create_productlist_slide_fallback(prs, group_name, pcon_df, mapping_df)
+                            st.info(f"INFO: Product List slide for '{group_name}' used fallback layout (Check name 'TableAnchor').")
 
-                ppt_bytes = safe_present(prs)
-                st.success("Your presentation is ready!")
-                st.download_button(
-                    "Download Muuto_Settings.pptx",
-                    data=ppt_bytes,
-                    file_name=OUTPUT_NAME,
-                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                )
+                    ppt_bytes = safe_present(prs)
+                    st.success("Your presentation is ready!")
+                    st.download_button(
+                        "Download Muuto_Settings.pptx",
+                        data=ppt_bytes,
+                        file_name=OUTPUT_NAME,
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    )
             except Exception as e:
                 st.error(f"Something went wrong while generating the presentation: {e}")
                 # st.exception(e) # Can be used for deeper debugging
@@ -815,3 +845,4 @@ if st.session_state.last_master_df is not None and st.session_state.last_mapping
     col_mp.metric("Mapping Data Rows", st.session_state.last_mapping_df.shape[0])
     if st.session_state.last_master_df.empty or st.session_state.last_mapping_df.empty:
         st.warning("WARNING: Zero rows loaded from Master/Mapping CSVs. Check URL accessibility.")
+```eof
