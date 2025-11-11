@@ -422,9 +422,10 @@ st.write(
     "og bruger en fast PowerPoint-skabelon i repoet."
 )
 
+
 # Session state for uploads
 if "uploads" not in st.session_state:
-    st.session_state.uploads = []
+    st.session_state.uploads = []  # list of dict: {"name":..., "bytes":...}
 
 # Only user group files
 files = st.file_uploader(
@@ -433,58 +434,33 @@ files = st.file_uploader(
     accept_multiple_files=True,
 )
 if files:
+    # Deduplicate by filename to prevent duplicates across reruns
+    existing_names = {u["name"] for u in st.session_state.uploads}
     for f in files:
-        st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
+        if f.name not in existing_names:
+            st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
+            existing_names.add(f.name)
 
-# File list with remove buttons
-st.header("Files")
+# Single flat list with sizes and remove buttons
+st.subheader("Files")
 if not st.session_state.uploads:
     st.info("No user group files uploaded yet.")
 else:
     to_remove = []
     for idx, f in enumerate(st.session_state.uploads):
-        col1, col2 = st.columns([4, 1])
+        size_kb = f"{len(f['bytes'])/1024:.1f}KB"
+        col1, col2, col3 = st.columns([6, 2, 1])
         with col1:
             st.caption(f["name"])
         with col2:
-            if st.button("❌ Remove", key=f"rm_{idx}"):
+            st.caption(size_kb)
+        with col3:
+            if st.button("❌", key=f"rm_{idx}"):
                 to_remove.append(idx)
     if to_remove:
         for i in sorted(to_remove, reverse=True):
             st.session_state.uploads.pop(i)
 
-generate = st.button("Generate presentation")
-
-def build_groups(upload_list: List[Dict]) -> Dict[str, Dict]:
-    groups: Dict[str, Dict] = {}
-    for item in upload_list:
-        name = item["name"]
-        b = item["bytes"]
-        key, t = group_key_from_filename(name)
-        if key not in groups:
-            groups[key] = {"name": key, "csv": None, "render": None, "floorplan": None}
-        if t == "csv":
-            groups[key]["csv"] = b
-        elif t == "render":
-            if groups[key]["render"] is None:
-                groups[key]["render"] = b
-        elif t in ["floorplan", "linedrawing"]:
-            if groups[key]["floorplan"] is None:
-                groups[key]["floorplan"] = b
-    return groups
-
-def collect_all_renderings(groups: Dict[str, Dict]) -> List[bytes]:
-    lst = []
-    for g in groups.values():
-        if g.get("render"):
-            lst.append(g["render"])
-    return lst
-
-def safe_present(prs: Presentation) -> bytes:
-    bio = io.BytesIO()
-    prs.save(bio)
-    bio.seek(0)
-    return bio.getvalue()
 
 if generate:
     if not TEMPLATE_PATH.exists():
@@ -525,5 +501,3 @@ if generate:
                 st.download_button("Download Muuto_Settings.pptx", data=ppt_bytes, file_name=OUTPUT_NAME, mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
         except Exception:
             st.error("Noget gik galt under genereringen. Kontroller at skabelonens layouts findes, og at inputfilerne er korrekte.")
-
-
