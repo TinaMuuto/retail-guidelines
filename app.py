@@ -550,23 +550,7 @@ if files:
             st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
             existing_names.add(f.name)
 
-# Single flat list without header or pagination
-if st.session_state.uploads:
-    to_remove = []
-    for idx, f in enumerate(st.session_state.uploads):
-        size_kb = f"{len(f['bytes'])/1024:.1f}KB"
-        col1, col2, col3 = st.columns([6, 2, 1])
-        with col1:
-            st.caption(f["name"])
-        with col2:
-            st.caption(size_kb)
-        with col3:
-            if st.button("❌", key=f"rm_{idx}"):
-                to_remove.append(idx)
-    if to_remove:
-        for i in sorted(to_remove, reverse=True):
-            st.session_state.uploads.pop(i)
-else:
+if not st.session_state.uploads:
     st.info("No user group files uploaded yet.")
 
 # Generate button
