@@ -1,13 +1,12 @@
 import io
 import re
-import tempfile
 from typing import Dict, List, Optional, Tuple
 import streamlit as st
 import pandas as pd
-import numpy as np
 from PIL import Image
 from pptx import Presentation
 from pptx.util import Inches
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
 import requests
 import time
 from pathlib import Path
@@ -15,8 +14,7 @@ from pathlib import Path
 # -----------------------------
 # Constants and defaults
 # -----------------------------
-# IMPORTANT: python-pptx kan kun læse .pptx. Sørg for at skabelonen er .pptx.
-TEMPLATE_PATH = Path("input-template.pptx")  # forventes at ligge i repo-roden sammen med app.py
+TEMPLATE_PATH = Path("input-template.pptx")  # fixed template in repo root
 DEFAULT_MASTER_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdNwE1Q_aG3BntCZZPRIOgXEFJ5AHJxHmRgirMx2FJqfttgCZ8on-j1vzxM-muTTvtAHwc-ovDV1qF/pub?output=csv"
 DEFAULT_MAPPING_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQPRmVmc0LYISduQdJyfz-X3LJlxiEDCNwW53LhFsWp5fFDS8V669rCd9VGoygBZSAZXeSNZ5fquPen/pub?output=csv"
 OUTPUT_NAME = "Muuto_Settings.pptx"
@@ -75,28 +73,24 @@ def add_picture_contain(slide, shape, image_bytes: bytes):
             im = im.convert("RGB")
             w, h = im.size
             max_dim = min(MAX_IMAGE_PX, max(w, h))
-            scale = min(1.0, max_dim / float(max(w, h)))
-            new_w, new_h = int(w * scale), int(h * scale)
-            if scale < 1.0:
-                im = im.resize((new_w, new_h), Image.LANCZOS)
+            scale_src_cap = min(1.0, max_dim / float(max(w, h)))
+            if scale_src_cap < 1.0:
+                im = im.resize((int(w * scale_src_cap), int(h * scale_src_cap)), Image.LANCZOS)
 
             frame_w = int(shape.width)
             frame_h = int(shape.height)
             s = min(frame_w / im.width, frame_h / im.height)
-            s = min(s, 1.0)
-            target_w = int(im.width * s)
-            target_h = int(im.height * s)
+            s = min(s, 1.0)  # do not upscale beyond current
+            target_w = max(1, int(im.width * s))
+            target_h = max(1, int(im.height * s))
 
-            canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
-            canvas.paste(im.resize((target_w, target_h), Image.LANCZOS), (0, 0))
-
-            out = io.BytesIO()
-            canvas.save(out, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-            out.seek(0)
+            out_buf = io.BytesIO()
+            im.resize((target_w, target_h), Image.LANCZOS).save(out_buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+            out_buf.seek(0)
 
             left = shape.left + int((shape.width - target_w) / 2)
             top = shape.top + int((shape.height - target_h) / 2)
-            slide.shapes.add_picture(out, left, top, width=target_w, height=target_h)
+            slide.shapes.add_picture(out_buf, left, top, width=target_w, height=target_h)
     except Exception:
         return
 
@@ -332,17 +326,17 @@ def chunk(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
-
+# -----------------------------
+# Fallback slide creators
+# -----------------------------
 def get_blank_layout(prs: Presentation):
-    # Try a "Blank" named layout, else first layout
     for layout in prs.slide_layouts:
-        if clean_name(layout.name) in ("blank",):
+        if clean_name(layout.name) in ("blank", "empty"):
             return layout
     return prs.slide_layouts[0]
 
 def create_overview_slide_fallback(prs: Presentation, images_batch):
     slide = prs.slides.add_slide(get_blank_layout(prs))
-    # Create a 3x4 grid of anchors for up to 12 images
     cols, rows = 4, 3
     margin_x, margin_y = Inches(0.5), Inches(1.0)
     cell_w = Inches(2.0)
@@ -352,8 +346,7 @@ def create_overview_slide_fallback(prs: Presentation, images_batch):
         c = (idx-1) % cols
         left = margin_x + c * (cell_w + Inches(0.2))
         top = margin_y + r * (cell_h + Inches(0.2))
-        # Add a dummy rectangle as anchor with the expected name
-        rect = slide.shapes.add_shape(1, left, top, cell_w, cell_h)  # 1 = MSO_AUTO_SHAPE_TYPE.RECTANGLE
+        rect = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, left, top, cell_w, cell_h)
         rect.name = f"Rendering{idx}"
         add_picture_contain(slide, rect, img_bytes)
 
@@ -365,40 +358,36 @@ def create_setting_slide_fallback(prs: Presentation,
                                   mapping_df: pd.DataFrame,
                                   master_df: pd.DataFrame):
     slide = prs.slides.add_slide(get_blank_layout(prs))
-    # Title
     title = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(8.0), Inches(0.6))
     title.name = "SETTINGNAME"
     set_text_preserve_format(title, group_name)
-    # Rendering and linedrawing anchors
-    render_anchor = slide.shapes.add_shape(1, Inches(0.5), Inches(1.2), Inches(5.5), Inches(3.5))
+
+    render_anchor = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0.5), Inches(1.2), Inches(5.5), Inches(3.5))
     render_anchor.name = "Rendering"
     if render_bytes:
         add_picture_contain(slide, render_anchor, render_bytes)
 
-    line_anchor = slide.shapes.add_shape(1, Inches(6.2), Inches(1.2), Inches(3.0), Inches(3.5))
+    line_anchor = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(6.2), Inches(1.2), Inches(3.0), Inches(3.5))
     line_anchor.name = "Linedrawing"
     if floorplan_bytes:
         add_picture_contain(slide, line_anchor, floorplan_bytes)
 
-    # Packshots grid 3x4 on lower half
     start_top = Inches(5.0)
     cell_w = Inches(1.6)
     cell_h = Inches(1.2)
     gap = Inches(0.2)
-    max_items = min(12, len(products_df))
     subset = products_df.head(12).copy() if len(products_df) > 12 else products_df.copy()
     for i, row in enumerate(subset.itertuples(index=False), start=1):
-        r = (i-1) // 6  # 2 rows of 6
+        r = (i-1) // 6
         c = (i-1) % 6
         left = Inches(0.5) + c * (cell_w + gap)
         top = start_top + r * (cell_h + Inches(0.6))
-        pack_anchor = slide.shapes.add_shape(1, left, top, cell_w, cell_h)
+        pack_anchor = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, left, top, cell_w, cell_h)
         pack_anchor.name = f"ProductPackshot{i}"
         pack_url = find_packshot_url(row.ARTICLE_NO, mapping_df, master_df)
         img_bytes = http_get_bytes(pack_url) if pack_url else None
         if img_bytes:
             add_picture_contain(slide, pack_anchor, img_bytes)
-        # Description below each packshot
         desc_box = slide.shapes.add_textbox(left, top + cell_h + Inches(0.05), cell_w, Inches(0.4))
         desc_box.name = f"PRODUCT DESCRIPTION {i}"
         set_text_preserve_format(desc_box, find_description(row.ARTICLE_NO, mapping_df))
@@ -408,11 +397,9 @@ def create_productlist_slide_fallback(prs: Presentation,
                                       products_df: pd.DataFrame,
                                       mapping_df: pd.DataFrame):
     slide = prs.slides.add_slide(get_blank_layout(prs))
-    # Title
     title = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(9.0), Inches(0.6))
     set_text_preserve_format(title, f"Products – {group_name}")
-    # Table anchor area
-    anchor = slide.shapes.add_shape(1, Inches(0.5), Inches(1.2), Inches(9.0), Inches(5.0))
+    anchor = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0.5), Inches(1.2), Inches(9.0), Inches(5.0))
     anchor.name = "TableAnchor"
     rows = max(1, len(products_df)) + 1
     cols = 3
@@ -518,35 +505,82 @@ st.set_page_config(page_title="Muuto PowerPoint Generator", layout="centered")
 st.title("Muuto PowerPoint Generator")
 st.write("Upload your group files (CSV and images). The app uses a fixed PowerPoint template from the repo and fetches Master Data and Mapping from fixed URLs.")
 
-
 # Session state for uploads
 if "uploads" not in st.session_state:
     st.session_state.uploads = []  # list of dict: {"name":..., "bytes":...}
 
-# Only user group files
+# Upload widget
 files = st.file_uploader(
     "User group files (.csv, .jpg, .png). You can add multiple files.",
     type=["csv", "jpg", "jpeg", "png"],
     accept_multiple_files=True,
 )
+
 if files:
-    # Deduplicate by filename to prevent duplicates across reruns
     existing_names = {u["name"] for u in st.session_state.uploads}
     for f in files:
         if f.name not in existing_names:
             st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
             existing_names.add(f.name)
 
-
+# Single flat list without header or pagination
+if st.session_state.uploads:
+    to_remove = []
+    for idx, f in enumerate(st.session_state.uploads):
+        size_kb = f"{len(f['bytes'])/1024:.1f}KB"
+        col1, col2, col3 = st.columns([6, 2, 1])
+        with col1:
+            st.caption(f["name"])
+        with col2:
+            st.caption(size_kb)
+        with col3:
+            if st.button("❌", key=f"rm_{idx}"):
+                to_remove.append(idx)
+    if to_remove:
+        for i in sorted(to_remove, reverse=True):
+            st.session_state.uploads.pop(i)
+else:
+    st.info("No user group files uploaded yet.")
 
 # Generate button
 generate = st.button("Generate presentation")
 
+def build_groups(upload_list: List[Dict]) -> Dict[str, Dict]:
+    groups: Dict[str, Dict] = {}
+    for item in upload_list:
+        name = item["name"]
+        b = item["bytes"]
+        key, t = group_key_from_filename(name)
+        if key not in groups:
+            groups[key] = {"name": key, "csv": None, "render": None, "floorplan": None}
+        if t == "csv":
+            groups[key]["csv"] = b
+        elif t == "render":
+            if groups[key]["render"] is None:
+                groups[key]["render"] = b
+        elif t in ["floorplan", "linedrawing"]:
+            if groups[key]["floorplan"] is None:
+                groups[key]["floorplan"] = b
+    return groups
+
+def collect_all_renderings(groups: Dict[str, Dict]) -> List[bytes]:
+    lst = []
+    for g in groups.values():
+        if g.get("render"):
+            lst.append(g["render"])
+    return lst
+
+def safe_present(prs: Presentation) -> bytes:
+    bio = io.BytesIO()
+    prs.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
 if generate:
     if not TEMPLATE_PATH.exists():
-        st.error("Template filen mangler i repoet: input-template.pptx")
+        st.error("Template file is missing in the repository: input-template.pptx")
     elif not st.session_state.uploads:
-        st.error("Upload mindst én gruppefil.")
+        st.error("Please upload at least one group file.")
     else:
         try:
             with st.spinner("Work in progress…"):
@@ -563,11 +597,11 @@ if generate:
 
                 renders = collect_all_renderings(groups)
                 if renders:
-    if overview_layout:
-        build_overview_slides(prs, overview_layout, renders)
-    else:
-        for batch in chunk(renders, MAX_OVERVIEW_IMAGES):
-            create_overview_slide_fallback(prs, batch)
+                    if overview_layout:
+                        build_overview_slides(prs, overview_layout, renders)
+                    else:
+                        for batch in chunk(renders, MAX_OVERVIEW_IMAGES):
+                            create_overview_slide_fallback(prs, batch)
 
                 for key in sorted(groups.keys()):
                     g = groups[key]
@@ -588,4 +622,4 @@ if generate:
                 st.success("Your presentation is ready")
                 st.download_button("Download Muuto_Settings.pptx", data=ppt_bytes, file_name=OUTPUT_NAME, mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
         except Exception:
-            st.error("Noget gik galt under genereringen. Kontroller at skabelonens layouts findes, og at inputfilerne er korrekte.")
+            st.error("Something went wrong while generating the presentation. Check the template layouts and the input files, then try again.")
