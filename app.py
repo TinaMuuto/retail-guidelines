@@ -12,10 +12,7 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
 from pptx.util import Inches
 
-# -----------------------------
-# Konstanter
-# -----------------------------
-TEMPLATE_PATH = Path("input-template.pptx")  # fast template i repoets rod
+TEMPLATE_PATH = Path("input-template.pptx")
 DEFAULT_MASTER_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdNwE1Q_aG3BntCZZPRIOgXEFJ5AHJxHmRgirMx2FJqfttgCZ8on-j1vzxM-muTTvtAHwc-ovDV1qF/pub?output=csv"
 DEFAULT_MAPPING_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQPRmVmc0LYISduQdJyfz-X3LJlxiEDCNwW53LhFsWp5fFDS8V669rCd9VGoygBZSAZXeSNZ5fquPen/pub?output=csv"
 OUTPUT_NAME = "Muuto_Settings.pptx"
@@ -25,9 +22,6 @@ HTTP_RETRIES = 1
 MAX_IMAGE_PX = 1400
 JPEG_QUALITY = 85
 
-# -----------------------------
-# Hjælpere
-# -----------------------------
 def clean_name(name: str) -> str:
     if name is None:
         return ""
@@ -136,10 +130,8 @@ def parse_csv_flex(buf: bytes) -> pd.DataFrame:
     return pd.DataFrame()
 
 def group_key_from_filename(name: str) -> Tuple[str, str]:
-    base = Path(name).stem  # uden extension
+    base = Path(name).stem
     lname = base.lower()
-
-    # Type
     if "floorplan" in lname:
         t = "floorplan"
     elif "linedrawing" in lname or "line_drawing" in lname or "line drawing" in lname:
@@ -152,17 +144,12 @@ def group_key_from_filename(name: str) -> Tuple[str, str]:
             t = "render"
         else:
             t = "other"
-
-    # Gruppens nøgle = delen efter " - " hvis til stede, ellers sidste segment
     if " - " in base:
         key = base.split(" - ", 1)[1]
     else:
         parts = re.split(r"[-_]", base)
         key = parts[-1] if parts else base
-
-    # Fjern trailing markører som " floorplan" / " linedrawing"
     key = re.sub(r"\s+(floorplan|line\s*drawing|linedrawing)$", "", key, flags=re.IGNORECASE).strip()
-
     return key, t
 
 def base_before_dash(s: str) -> str:
@@ -185,9 +172,6 @@ def ensure_presentation_from_path(path: Path) -> Presentation:
         raise FileNotFoundError(f"Template not found: {path}")
     return Presentation(str(path))
 
-# -----------------------------
-# Databehandling
-# -----------------------------
 def load_remote_csv(url: str) -> pd.DataFrame:
     content = http_get_bytes(url)
     if content is None:
@@ -268,39 +252,28 @@ def normalize_mapping(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_pcon(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
-
     norm = {c: re.sub(r"[^a-z0-9]", "", c.lower()) for c in df.columns}
-
-    # artikel
     article_col = None
     for c in df.columns:
         key = norm[c]
-        if (
-            key in {
-                "articleno","article","articlenumber","artno","artnr","artnumber","itemno","itemnumber","articlecode"
-            } or ("article" in key and "no" in key) or ("item" in key and "no" in key)
-        ):
+        if (key in {"articleno","article","articlenumber","artno","artnr","artnumber","itemno","itemnumber","articlecode"}
+            or ("article" in key and "no" in key) or ("item" in key and "no" in key)):
             article_col = c
             break
-
-    # qty
     qty_col = None
     for c in df.columns:
         key = norm[c]
         if key in {"qty","quantity","quantities","qtytotal","qtysum"} or "qty" in key:
             qty_col = c
             break
-
     if article_col is None:
         return pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
-
     out = pd.DataFrame()
     out["ARTICLE_NO"] = df[article_col].astype(str).fillna("")
     if qty_col is not None:
         out["Quantity"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(1).astype(int)
     else:
         out["Quantity"] = 1
-
     out["ARTICLE_BASE"] = out["ARTICLE_NO"].apply(base_before_dash)
     return out[["ARTICLE_NO", "Quantity", "ARTICLE_BASE"]]
 
@@ -352,9 +325,6 @@ def chunk(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
-# -----------------------------
-# Fallback-slides
-# -----------------------------
 def get_blank_layout(prs: Presentation):
     for layout in prs.slide_layouts:
         if clean_name(layout.name) in ("blank", "empty"):
@@ -444,28 +414,21 @@ def create_productlist_slide_fallback(prs: Presentation,
         table.cell(r, 2).text = f"{row.ARTICLE_NO} / {new_item}" if new_item else f"{row.ARTICLE_NO}"
         r += 1
 
-# -----------------------------
-# Slide builders
-# -----------------------------
 def build_overview_slides(prs: Presentation, overview_layout, rendering_bytes_list: List[bytes]):
     for batch in chunk(rendering_bytes_list, MAX_OVERVIEW_IMAGES):
         slide = prs.slides.add_slide(overview_layout)
         shape_map = build_shape_map(slide)
-
-        # find alle shapes der ligner rendering-pladsholdere
         candidates = []
         for key, shapes in shape_map.items():
             if key.startswith("rendering"):
                 for sh in shapes:
                     candidates.append((int(sh.top), int(sh.left), sh))
         candidates.sort(key=lambda t: (t[0], t[1]))
-
         if candidates:
             for (img_bytes, (_, __, target_shape)) in zip(batch, candidates):
                 if img_bytes:
                     add_picture_contain(slide, target_shape, img_bytes)
         else:
-            # fallback: prøv Rendering1..Rendering12
             for idx, img_bytes in enumerate(batch, start=1):
                 key = clean_name(f"Rendering{idx}")
                 if key in shape_map:
@@ -559,7 +522,6 @@ def preflight_checks() -> Dict[str, str]:
             results["template"] = "OK"
     except Exception:
         results["template"] = "Template unreadable or not a valid .pptx."
-
     try:
         m = http_get_bytes(DEFAULT_MASTER_URL)
         results["master_csv"] = "OK" if m else "Unavailable"
@@ -572,15 +534,12 @@ def preflight_checks() -> Dict[str, str]:
         results["mapping_csv"] = "Unavailable"
     return results
 
-# -----------------------------
-# UI
-# -----------------------------
 st.set_page_config(page_title="Muuto PowerPoint Generator", layout="centered")
 st.title("Muuto PowerPoint Generator")
 st.write("Upload your group files (CSV and images). The app uses a fixed PowerPoint template from the repo and fetches Master Data and Mapping from fixed URLs.")
 
 if "uploads" not in st.session_state:
-    st.session_state.uploads = []  # [{name, bytes}]
+    st.session_state.uploads = []
 
 files = st.file_uploader(
     "User group files (.csv, .jpg, .png). You can add multiple files.",
@@ -593,8 +552,6 @@ if files:
         if f.name not in existing:
             st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
             existing.add(f.name)
-
-# Vis kun Streamlits egen liste; ingen ekstra liste
 
 generate = st.button("Generate presentation")
 
@@ -626,23 +583,16 @@ def safe_present(prs: Presentation) -> bytes:
     return bio.getvalue()
 
 if generate:
-    diag = preflight_checks()
-    if diag.get("template") != "OK":
-        st.error("Template issue: " + diag.get("template", "Unknown"))
-    if diag.get("master_csv") != "OK":
-        st.warning("Master Data source not reachable. Proceeding without packshots.")
-    if diag.get("mapping_csv") != "OK":
-        st.warning("Mapping source not reachable. Proceeding without descriptions and new item mapping.")
-
-    if not TEMPLATE_PATH.exists():
-        st.error("Template file is missing in the repository: input-template.pptx")
-    elif diag.get("template") != "OK":
-        st.error("Template unreadable. Ensure it is a valid .pptx.")
-    elif not st.session_state.uploads:
-        st.error("Please upload at least one group file.")
-    else:
-        try:
-            with st.spinner("Work in progress…"):
+    with st.spinner("Work in progress…"):
+        diag = preflight_checks()
+        if diag.get("template") != "OK":
+            st.error("Template issue: " + diag.get("template", "Unknown"))
+        elif not TEMPLATE_PATH.exists():
+            st.error("Template file is missing in the repository: input-template.pptx")
+        elif not st.session_state.uploads:
+            st.error("Please upload at least one group file.")
+        else:
+            try:
                 prs = ensure_presentation_from_path(TEMPLATE_PATH)
 
                 overview_layout = find_layout_by_name(prs, "Overview") or find_layout_by_name(prs, "Renderings")
@@ -684,6 +634,7 @@ if generate:
 
                 ppt_bytes = safe_present(prs)
                 st.success("Your presentation is ready")
-                st.download_button("Download Muuto_Settings.pptx", data=ppt_bytes, file_name=OUTPUT_NAME, mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
-        except Exception:
-            st.error("Something went wrong while generating the presentation. Check the template and inputs, then try again.")
+                st.download_button("Download Muuto_Settings.pptx", data=ppt_bytes, file_name=OUTPUT_NAME,
+                                   mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+            except Exception:
+                st.error("Something went wrong while generating the presentation. Check the template and inputs, then try again.")
