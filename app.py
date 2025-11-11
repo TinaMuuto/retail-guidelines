@@ -135,8 +135,13 @@ def parse_csv_flex(buf: bytes) -> pd.DataFrame:
 
 def group_key_from_filename(name: str) -> Tuple[str, str]:
     base = Path(name).stem
-    m = re.split(r"[-_]", base, maxsplit=1)
-    prefix = m[0].strip() if m else base.strip()
+    # Prefer segment after " - " if present
+    if " - " in base:
+        prefix = base.split(" - ", 1)[1].strip()
+    else:
+        # fallback to last segment split on _ or -
+        parts = re.split(r"[-_]", base)
+        prefix = parts[-1].strip() if parts else base.strip()
     lname = name.lower()
     if "floorplan" in lname:
         t = "floorplan"
@@ -465,6 +470,20 @@ def preflight_checks() -> Dict[str, str]:
         results["mapping_csv"] = "Unavailable"
     return results
 
+
+def layout_has_expected(layout, keys: List[str]) -> bool:
+    try:
+        names = [clean_name(getattr(sh, "name", "")) for sh in layout.shapes]
+    except Exception:
+        names = []
+    for k in keys:
+        if clean_name(k) in names:
+            return True
+    # Sometimes layouts use identical names like {{Rendering}} for many shapes; accept "rendering" prefix
+    if any(n.startswith("rendering") for n in names):
+        return True
+    return False
+
 # -----------------------------
 # Slide builders
 # -----------------------------
@@ -658,7 +677,7 @@ if generate:
 
                 renders = collect_all_renderings(groups)
                 if renders:
-                    if overview_layout:
+                    if overview_layout and layout_has_expected(overview_layout, ["Rendering"]):
                         build_overview_slides(prs, overview_layout, renders)
                     else:
                         for batch in chunk(renders, MAX_OVERVIEW_IMAGES):
@@ -673,7 +692,7 @@ if generate:
                         pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
                     if pcon_df.empty:
                         pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
-                    if setting_layout:
+                    if setting_layout and layout_has_expected(setting_layout, ["SETTINGNAME","Rendering","ProductPackshot1"]):
                         build_setting_slide(prs, setting_layout, group_name, g.get("render"), g.get("floorplan"), pcon_df, mapping_df, master_df)
                     else:
                         create_setting_slide_fallback(prs, group_name, g.get("render"), g.get("floorplan"), pcon_df, mapping_df, master_df)
