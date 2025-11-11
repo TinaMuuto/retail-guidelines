@@ -17,7 +17,7 @@ from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, PP_PLACEHOLDER
 TEMPLATE_PATH = Path("input-template.pptx")
 # Google Sheets URLs for Master and Mapping data (PUBLICLY ACCESSIBLE CSV EXPORTS)
 DEFAULT_MASTER_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdNwE1Q_aG3BntCZZPRIOgXEFJ5AHJxHmRgirMx2FJqfttgCZ8on-j1vzxM-muTTvtAHwc-ovDV1qF/pub?output=csv"
-DEFAULT_MAPPING_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQPRmVmc0LYISduQdJyfz-X3LJlxiEDCNwW53LhFsWp5fFDS8V669rCd9VGoygBZSAZXeSNZ5fquPen/pub?output=csv"
+DEFAULT_MAPPING_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQPRmVmc0LYISduQdJyfz-X3LJlxiEDCNwW53LhFsWp5fFDS8V669rCdVGoygBZSAZXeSNZ5fquPen/pub?output=csv"
 OUTPUT_NAME = "Muuto_Settings.pptx"
 
 MAX_OVERVIEW_IMAGES = 12
@@ -91,6 +91,7 @@ def http_get_bytes(url: str) -> Optional[bytes]:
     for attempt in range(HTTP_RETRIES + 1):
         try:
             resp = requests.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
+            # Check content type if needed, but rely on status code 200 for binary data
             if resp.status_code == 200 and resp.content:
                 return resp.content
         except Exception:
@@ -112,7 +113,6 @@ def parse_csv_flex(buf: bytes) -> pd.DataFrame:
     ]
     for c in candidates:
         try:
-            # Ensure proper data stripping for keys
             return pd.read_csv(io.BytesIO(buf), sep=c["sep"], encoding=c["encoding"], skipinitialspace=True)
         except Exception:
             continue
@@ -145,7 +145,7 @@ def normalize_master(df: pd.DataFrame) -> pd.DataFrame:
     
     out = df[[item_col, col_img]].copy()
     out.columns = ["ITEM NO.", "IMAGE"]
-    out["ITEM NO."] = out["ITEM NO."].astype(str).str.strip().apply(normalize_key) # Normalize key data
+    out["ITEM NO."] = out["ITEM NO."].astype(str).str.strip().apply(normalize_key) 
     out["IMAGE"] = out["IMAGE"].astype(str).str.strip()       
     return out
 
@@ -167,7 +167,7 @@ def normalize_mapping(df: pd.DataFrame) -> pd.DataFrame:
     out = df[[col_old, col_desc, col_new]].copy()
     out.columns = ["OLD Item-variant", "Description", "New Item No."]
     
-    out["OLD Item-variant"] = out["OLD Item-variant"].astype(str).str.strip().apply(normalize_key) # Normalize key data
+    out["OLD Item-variant"] = out["OLD Item-variant"].astype(str).str.strip().apply(normalize_key)
     out["New Item No."] = out["New Item No."].astype(str).str.strip()
     out["Description"] = out["Description"].astype(str).str.strip()
     return out
@@ -298,7 +298,6 @@ def build_groups(upload_list: List[Dict]) -> Dict[str, Dict]:
     for key, g in groups.items():
         if g["csv"] and g["render"]:
             valid_groups[key] = g
-        # else: group is skipped as per user rule
 
     return valid_groups
 
@@ -336,48 +335,52 @@ def add_picture_contain(slide, shape, image_bytes: bytes):
         if not image_bytes:
             return
         
-        with Image.open(io.BytesIO(image_bytes)) as im:
-            # 1. Convert to RGB for universal PPTX/JPEG compatibility
-            if im.mode in ("RGBA", "LA", "P"):
-                 im = im.convert("RGB")
+        # Use Image.open with deferred loading to try handling difficult formats
+        im = Image.open(io.BytesIO(image_bytes))
+        
+        # 1. Convert to RGB for universal PPTX/JPEG compatibility
+        if im.mode in ("RGBA", "LA", "P"):
+             im = im.convert("RGB")
+        
+        w, h = im.size
+        
+        # 2. Scale image source down if too large (performance)
+        max_dim = min(MAX_IMAGE_PX, max(w, h))
+        scale_src_cap = min(1.0, max_dim / float(max(w, h)))
+        if scale_src_cap < 1.0:
+            im = im.resize((int(w * scale_src_cap), int(h * scale_src_cap)), Image.Resampling.LANCZOS)
+            w, h = im.size # Update dimensions
 
-            w, h = im.size
-            
-            # 2. Scale image source down if too large (performance)
-            max_dim = min(MAX_IMAGE_PX, max(w, h))
-            scale_src_cap = min(1.0, max_dim / float(max(w, h)))
-            if scale_src_cap < 1.0:
-                im = im.resize((int(w * scale_src_cap), int(h * scale_src_cap)), Image.Resampling.LANCZOS)
-                w, h = im.size # Update dimensions
+        frame_w = int(shape.width)
+        frame_h = int(shape.height)
+        
+        # 3. Calculate Contain-Fit scale factor (fit within shape without stretching/cropping)
+        s = min(frame_w / w, frame_h / h)
+        s = min(s, 1.0) # Do not upscale beyond natural size
+        target_w = max(1, int(w * s))
+        target_h = max(1, int(h * s))
 
-            frame_w = int(shape.width)
-            frame_h = int(shape.height)
-            
-            # 3. Calculate Contain-Fit scale factor (fit within shape without stretching/cropping)
-            s = min(frame_w / w, frame_h / h)
-            s = min(s, 1.0) # Do not upscale beyond natural size
-            target_w = max(1, int(w * s))
-            target_h = max(1, int(h * s))
+        buf = io.BytesIO()
+        im.resize((target_w, target_h), Image.Resampling.LANCZOS).save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        buf.seek(0)
 
-            buf = io.BytesIO()
-            im.resize((target_w, target_h), Image.Resampling.LANCZOS).save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-            buf.seek(0)
-
-            # 4. Calculate center position
-            left = shape.left + int((shape.width - target_w) / 2)
-            top = shape.top + int((shape.height - target_h) / 2)
-            
-            # 5. Insert and clean up shape
-            slide.shapes.add_picture(buf, left, top, width=target_w, height=target_h)
-            
-            # Delete the original anchor shape (if it's a regular shape, not a placeholder)
-            try:
-                if not getattr(shape, "is_placeholder", False):
-                    shape.element.getparent().remove(shape.element)
-            except Exception:
-                pass
-            
-    except Exception:
+        # 4. Calculate center position
+        left = shape.left + int((shape.width - target_w) / 2)
+        top = shape.top + int((shape.height - target_h) / 2)
+        
+        # 5. Insert and clean up shape
+        slide.shapes.add_picture(buf, left, top, width=target_w, height=target_h)
+        
+        # Delete the original anchor shape (if it's a regular shape, not a placeholder)
+        try:
+            if not getattr(shape, "is_placeholder", False):
+                shape.element.getparent().remove(shape.element)
+        except Exception:
+            pass
+        
+    except Exception as e:
+        # Crucial for debugging: if image insertion fails, tell the user
+        st.error(f"Image processing failed for insertion (PIL/PPTX): {type(e).__name__}: {str(e)}")
         return
 
 def add_picture_into_shape(slide, shape, image_bytes: bytes):
@@ -439,18 +442,21 @@ def build_setting_slide(prs: Presentation,
     render_shape = safe_find_shape(shape_map, "Rendering")
     if render_shape and render_bytes:
         add_picture_into_shape(slide, render_shape, render_bytes)
+    elif render_shape:
+        set_text_preserve_format(render_shape, "RENDERING IMAGE MISSING")
         
     floorplan_shape = safe_find_shape(shape_map, "Linedrawing") 
     if floorplan_shape and floorplan_bytes:
         add_picture_into_shape(slide, floorplan_shape, floorplan_bytes)
+    elif floorplan_shape:
+        set_text_preserve_format(floorplan_shape, "LINE DRAWING MISSING")
         
     # 3. Products and Descriptions
-    # NOTE: The loop starts at 1, matching placeholder names ProductPackshot1, etc.
     for i in range(1, MAX_OVERVIEW_IMAGES + 1): 
         if i > len(products_df):
             break
             
-        row = products_df.iloc[i-1] # Pandas indexing starts at 0
+        row = products_df.iloc[i-1] 
         article_no = row["ARTICLE_NO"]
         
         # Lookups
@@ -466,9 +472,10 @@ def build_setting_slide(prs: Presentation,
             if img_bytes:
                 add_picture_into_shape(slide, pic_shape, img_bytes)
             elif pack_url:
-                set_text_preserve_format(pic_shape, "IMAGE URL FOUND, BUT FAILED TO DOWNLOAD")
+                set_text_preserve_format(pic_shape, "IMAGE URL FOUND, DOWNLOAD FAILED")
             else:
-                set_text_preserve_format(pic_shape, f"IMAGE MISSING for {article_no}")
+                # If pack_url is None, it means lookup failed in Mapping/Master
+                set_text_preserve_format(pic_shape, f"PACKSHOT LOOKUP FAILED for {article_no}")
             
         # b) Product Description
         desc_key = clean_name(f"PRODUCT DESCRIPTION {i}")
@@ -525,7 +532,7 @@ def build_productlist_slide(prs: Presentation,
         table.cell(r, 2).text = article_text
         r += 1
 
-# --- PPTX Utility Functions (Moving out of main flow) ---
+# --- PPTX Utility Functions (Other) ---
 
 def chunk(lst, n):
     """Splits a list into chunks of size n."""
@@ -556,11 +563,9 @@ def layout_has_expected(layout, keys: List[str]) -> bool:
     except Exception:
         names = []
         
-    # Check for exact match
     if any(clean_name(k) in names for k in keys):
         return True
         
-    # Specific check for Setting Layout: Checks if it contains Rendering OR Packshot1
     if clean_name(layout.name) == clean_name("Setting"):
         if any(n.startswith("productpackshot") for n in names) or any(n.startswith("packshot") for n in names) or clean_name("Rendering") in names:
             return True
@@ -702,11 +707,8 @@ if generate:
                     if renders:
                         if overview_layout and layout_has_expected(overview_layout, ["Rendering1"]):
                             build_overview_slides(prs, overview_layout, renders)
-                        else:
-                            # Fallback if specific placeholders are not found
-                            for batch in chunk(renders, MAX_OVERVIEW_IMAGES):
-                                # NOTE: Fallback implementations removed for brevity, assuming standard build methods will work once template is fixed
-                                pass # Simplified for final implementation
+                        # NOTE: Fallback implementations removed for brevity
+                    
 
                     # 2. Per group Slides
                     for key in sorted(groups.keys()):
