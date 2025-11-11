@@ -417,10 +417,7 @@ def build_productlist_slide(prs: Presentation,
 # -----------------------------
 st.set_page_config(page_title="Muuto PowerPoint Generator", layout="centered")
 st.title("Muuto PowerPoint Generator")
-st.write(
-    "Upload dine gruppefiler (CSV + billeder). Appen henter Master Data og Mapping fra faste URL'er "
-    "og bruger en fast PowerPoint-skabelon i repoet."
-)
+st.write("Upload your group files (CSV and images). The app uses a fixed PowerPoint template from the repo and fetches Master Data and Mapping from fixed URLs.")
 
 
 # Session state for uploads
@@ -461,6 +458,9 @@ else:
         for i in sorted(to_remove, reverse=True):
             st.session_state.uploads.pop(i)
 
+
+# Generate button
+generate = st.button("Generate presentation")
 
 if generate:
     if not TEMPLATE_PATH.exists():
