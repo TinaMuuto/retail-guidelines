@@ -12,11 +12,6 @@ from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, PP_PLACEHOLDER
 
-# --- STREAMLIT CACHING DEKORATORER ---
-# Sørger for, at eksterne data og skabelon kun indlæses, når det er nødvendigt.
-# st.cache_data.clear() # Deaktiveret: Fjern denne linje i produktion
-# st.cache_resource.clear() # Deaktiveret: Fjern denne linje i produktion
-
 # ---------------------- Constants ----------------------
 TEMPLATE_PATH = Path("input-template.pptx")
 # NYE URLs afledt af bruger input. Disse SKAL være offentligt delte (Anyone with the link)!
@@ -86,7 +81,7 @@ def safe_find_shape(shape_map: Dict[str, list], key: str, index: int = 0) -> Opt
 
     return None
 
-# --- Utils - Network & Data Loading (CACHED VERSION) ---
+# ---------------------- Utils - Network & Data Loading (CACHED VERSION) ----------------------
 
 def http_get_bytes(url: str) -> Optional[bytes]:
     """Henter indholdet af en URL med genforsøg og timeout."""
@@ -140,7 +135,7 @@ def load_and_normalize_mapping(url: str) -> pd.DataFrame:
     df = parse_csv_flex(content)
     return normalize_mapping(df)
 
-# --- Utils - Data Normalization ---
+# ---------------------- Utils - Data Normalization ----------------------
 
 def normalize_master(df: pd.DataFrame) -> pd.DataFrame:
     """Normaliserer Master Data (Packshot URLs)."""
@@ -208,7 +203,7 @@ def normalize_pcon(df: pd.DataFrame) -> pd.DataFrame:
         
     return out[["ARTICLE_NO", "Quantity"]]
 
-# --- Utils - Data Lookup Functions (Combined) ---
+# ---------------------- Utils - Data Lookup Functions (Combined) ----------------------
 
 def lookup_data_with_fallback(article_no: str, df: pd.DataFrame, key_col: str, return_col: str, normalize_func=normalize_key) -> str:
     """Udfører direkte match, derefter base match opslag."""
@@ -258,7 +253,7 @@ def find_new_item(article_no: str, mapping_df: pd.DataFrame) -> Optional[str]:
     val = lookup_data_with_fallback(article_no, mapping_df, "OLD Item-variant", "New Item No.")
     return val if val else None
 
-# --- Utils - File Grouping & PPTX Helpers ---
+# ---------------------- Utils - File Grouping & PPTX Helpers ----------------------
 
 def group_key_from_filename(name: str) -> Tuple[str, str]:
     """Udtrækker gruppenøgle og filtype fra filnavnet (bruger alt efter ' - ')."""
@@ -334,7 +329,7 @@ def set_text_preserve_format(shape, text: str):
     except Exception:
         pass
 
-# --- Utils - Image Processing & Insertion ---
+# ---------------------- Utils - Image Processing & Insertion ----------------------
 
 def add_picture_contain(slide, shape, image_bytes: bytes):
     """Indsætter et billede, sikrer at det passer (contain-fit) og konverterer til kompatibel JPEG/RGB."""
@@ -388,7 +383,7 @@ def add_picture_into_shape(slide, shape, image_bytes: bytes):
         return
     add_picture_contain(slide, shape, image_bytes)
 
-# --- PPTX Slide Builders ---
+# ---------------------- PPTX Slide Builders ----------------------
 
 def add_table(slide, anchor_shape, rows: int, cols: int):
     """Opretter en tabel ved hjælp af anker-shapens position og størrelse."""
@@ -527,7 +522,7 @@ def build_productlist_slide(prs: Presentation,
         table.cell(r, 2).text = article_text
         r += 1
 
-# --- PPTX Utility Functions (Other) ---
+# ---------------------- PPTX Utility Functions (Other) ----------------------
 
 def chunk(lst, n):
     """Deler en liste op i chunks af størrelse n."""
@@ -621,7 +616,7 @@ if "uploads" not in st.session_state:
     st.session_state.uploads = []
 
 # --- Data Caching Status (Kald de rettede funktioner her) ---
-# Dette er løsningen på UnhashableParamError
+# Løsningen på UnhashableParamError
 master_df = load_and_normalize_master(DEFAULT_MASTER_URL)
 mapping_df = load_and_normalize_mapping(DEFAULT_MAPPING_URL)
 
@@ -637,7 +632,7 @@ if files:
         if f.name not in existing:
             st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
             existing.add(f.name)
-    st.rerun()
+    # st.rerun() er fjernet her for at undgå den rekursive loading-sløjfe.
 
 # Uploaded Files List
 if st.session_state.uploads:
@@ -654,7 +649,7 @@ if st.session_state.uploads:
     if remove_indices:
         for i in sorted(remove_indices, reverse=True):
             del st.session_state.uploads[i]
-        st.rerun()
+        st.rerun() # BEHOLDES: Nødvendigt for at opdatere listen korrekt efter fjernelse.
 
 generate = st.button("Generate Presentation")
 
@@ -680,7 +675,7 @@ if generate:
                     setting_layout = find_layout_by_name(prs, "Setting")
                     productlist_layout = find_layout_by_name(prs, "ProductListBlank")
                     
-                    # --- DIAGNOSTIK OG ADVARSLER (bruger cachede DFs) ---
+                    # --- DIAGNOSTIK OG ADVARSLER ---
                     if mapping_df.empty:
                         st.warning("ADVARSEL: Mapping Data kunne IKKE indlæses.")
                     
