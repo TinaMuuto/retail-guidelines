@@ -54,13 +54,13 @@ def set_text_preserve_format(shape, text: str):
     except Exception:
         pass
 
-def build_shape_map(slide) -> Dict[str, object]:
+def build_shape_map(slide) -> Dict[str, list]:
     mapping = {}
     for shape in slide.shapes:
         try:
             nm = clean_name(getattr(shape, "name", ""))
             if nm:
-                mapping[nm] = shape
+                mapping.setdefault(nm, []).append(shape)
         except Exception:
             continue
     return mapping
@@ -252,31 +252,51 @@ def normalize_mapping(df: pd.DataFrame) -> pd.DataFrame:
     out["NEW BASE"] = out["New Item No."].apply(base_before_dash)
     return out
 
+
 def normalize_pcon(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
-    mapping = {}
+
+    # Normalize column keys for matching
+    norm = {c: re.sub(r"[^a-z0-9]", "", c.lower()) for c in df.columns}
+
+    # Candidate keys for article number
+    article_col = None
     for c in df.columns:
-        cl = c.strip().lower().replace(" ", "").replace("_", "")
-        if cl in ["articleno", "article", "articlenumber", "article_no"]:
-            mapping[c] = "ARTICLE_NO"
-        if cl in ["qty", "quantity", "quantities"]:
-            mapping[c] = "Quantity"
-    if "ARTICLE_NO" not in mapping.values():
-        for c in df.columns:
-            if c.strip().upper() == "ARTICLE_NO":
-                mapping[c] = "ARTICLE_NO"
-                break
-    if "Quantity" not in mapping.values():
-        df["__qty__"] = 1
-        mapping["__qty__"] = "Quantity"
-    out = df.rename(columns=mapping)
-    cols = [k for k, v in mapping.items() if v in ["ARTICLE_NO", "Quantity"]]
-    out = out[cols].copy()
-    out.columns = ["ARTICLE_NO", "Quantity"]
+        key = norm[c]
+        if (
+            key in {
+                "articleno","article","articlenumber","articleno",
+                "artno","artnr","artnumber","itemno","itemnumber","articlecode"
+            }
+            or ("article" in key and "no" in key)
+            or ("item" in key and "no" in key)
+        ):
+            article_col = c
+            break
+
+    # Candidate keys for quantity
+    qty_col = None
+    for c in df.columns:
+        key = norm[c]
+        if key in {"qty","quantity","quantities","qtytotal","qtysum"} or "qty" in key:
+            qty_col = c
+            break
+
+    # If we cannot find an article column, return empty to avoid exceptions
+    if article_col is None:
+        return pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
+
+    out = pd.DataFrame()
+    out["ARTICLE_NO"] = df[article_col].astype(str).fillna("")
+    if qty_col is not None:
+        out["Quantity"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(1).astype(int)
+    else:
+        out["Quantity"] = 1
+
     out["ARTICLE_BASE"] = out["ARTICLE_NO"].apply(base_before_dash)
-    out["Quantity"] = pd.to_numeric(out["Quantity"], errors="coerce").fillna(1).astype(int)
-    return out
+    return out[["ARTICLE_NO", "Quantity", "ARTICLE_BASE"]]
+
 
 def find_packshot_url(article_no: str, mapping_df: pd.DataFrame, master_df: pd.DataFrame) -> Optional[str]:
     if master_df is None or master_df.empty:
@@ -448,14 +468,30 @@ def preflight_checks() -> Dict[str, str]:
 # -----------------------------
 # Slide builders
 # -----------------------------
+
 def build_overview_slides(prs: Presentation, overview_layout, rendering_bytes_list: List[bytes]):
     for batch in chunk(rendering_bytes_list, MAX_OVERVIEW_IMAGES):
         slide = prs.slides.add_slide(overview_layout)
         shape_map = build_shape_map(slide)
-        for idx, img_bytes in enumerate(batch, start=1):
-            key = clean_name(f"Rendering{idx}")
-            if key in shape_map and img_bytes:
-                add_picture_contain(slide, shape_map[key], img_bytes)
+        # Collect all shapes that look like rendering placeholders
+        candidates = []
+        for key, shapes in shape_map.items():
+            if key.startswith("rendering"):
+                # add all with left/top order to keep layout grid
+                for sh in shapes:
+                    candidates.append((sh.left, sh.top, sh))
+        # sort by top then left
+        candidates.sort(key=lambda t: (int(t[1]), int(t[0])))
+        # place images sequentially
+        for (img_bytes, (_, _, target_shape)) in zip(batch, candidates):
+            if img_bytes:
+                add_picture_contain(slide, target_shape, img_bytes)
+        # if no explicit rendering placeholders, fall back to names Rendering1..Rendering12
+        if not candidates:
+            for idx, img_bytes in enumerate(batch, start=1):
+                key = clean_name(f"Rendering{idx}")
+                if key in shape_map:
+                    add_picture_contain(slide, shape_map[key][0], img_bytes)
 
 def build_setting_slide(prs: Presentation,
                         setting_layout,
@@ -468,22 +504,22 @@ def build_setting_slide(prs: Presentation,
     slide = prs.slides.add_slide(setting_layout)
     shape_map = build_shape_map(slide)
     if clean_name("SETTINGNAME") in shape_map:
-        set_text_preserve_format(shape_map[clean_name("SETTINGNAME")], group_name)
+        set_text_preserve_format(shape_map[clean_name("SETTINGNAME")][0], group_name)
     if clean_name("Rendering") in shape_map and render_bytes:
-        add_picture_contain(slide, shape_map[clean_name("Rendering")], render_bytes)
+        add_picture_contain(slide, shape_map[clean_name("Rendering")][0], render_bytes)
     if clean_name("Linedrawing") in shape_map and floorplan_bytes:
-        add_picture_contain(slide, shape_map[clean_name("Linedrawing")], floorplan_bytes)
+        add_picture_contain(slide, shape_map[clean_name("Linedrawing")][0], floorplan_bytes)
     subset = products_df.head(12).copy() if len(products_df) > 12 else products_df.copy()
     for i, row in enumerate(subset.itertuples(index=False), start=1):
         pack_url = find_packshot_url(row.ARTICLE_NO, mapping_df, master_df)
         img_bytes = http_get_bytes(pack_url) if pack_url else None
         pic_key = clean_name(f"ProductPackshot{i}")
         if pic_key in shape_map and img_bytes:
-            add_picture_contain(slide, shape_map[pic_key], img_bytes)
+            add_picture_contain(slide, shape_map[pic_key][0], img_bytes)
         desc_key = clean_name(f"PRODUCT DESCRIPTION {i}")
         if desc_key in shape_map:
             desc = find_description(row.ARTICLE_NO, mapping_df)
-            set_text_preserve_format(shape_map[desc_key], desc)
+            set_text_preserve_format(shape_map[desc_key][0], desc)
 
 def build_productlist_slide(prs: Presentation,
                             layout,
@@ -492,7 +528,8 @@ def build_productlist_slide(prs: Presentation,
                             mapping_df: pd.DataFrame):
     slide = prs.slides.add_slide(layout)
     shape_map = build_shape_map(slide)
-    title_shape = shape_map.get(clean_name("Title"), None)
+    title_shapes = shape_map.get(clean_name("Title"), None)
+    title_shape = title_shapes[0] if title_shapes else None
     if title_shape is None:
         for s in slide.shapes:
             if hasattr(s, "text_frame") and s.text_frame:
@@ -500,7 +537,8 @@ def build_productlist_slide(prs: Presentation,
                 break
     if title_shape:
         set_text_preserve_format(title_shape, f"Products – {group_name}")
-    anchor = shape_map.get(clean_name("TableAnchor"), None)
+    anchors = shape_map.get(clean_name("TableAnchor"), None)
+    anchor = anchors[0] if anchors else None
     if not anchor:
         class Dummy: pass
         anchor = Dummy()
@@ -608,7 +646,7 @@ if generate:
         try:
             with st.spinner("Work in progress…"):
                 prs = ensure_presentation_from_path(TEMPLATE_PATH)
-                overview_layout = find_layout_by_name(prs, "Overview")
+                overview_layout = find_layout_by_name(prs, "Overview") or find_layout_by_name(prs, "Renderings")
                 setting_layout = find_layout_by_name(prs, "Setting")
                 productlist_layout = find_layout_by_name(prs, "ProductListBlank")
                 groups = build_groups(st.session_state.uploads)
@@ -629,7 +667,10 @@ if generate:
                 for key in sorted(groups.keys()):
                     g = groups[key]
                     group_name = g["name"]
-                    pcon_df = normalize_pcon(parse_csv_flex(g["csv"]) if g["csv"] else pd.DataFrame())
+                    try:
+                        pcon_df = normalize_pcon(parse_csv_flex(g["csv"]) if g["csv"] else pd.DataFrame())
+                    except Exception:
+                        pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
                     if pcon_df.empty:
                         pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
                     if setting_layout:
