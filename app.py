@@ -418,6 +418,33 @@ def create_productlist_slide_fallback(prs: Presentation,
         table.cell(r, 2).text = f"{row.ARTICLE_NO} / {new_item}" if new_item else f"{row.ARTICLE_NO}"
         r += 1
 
+
+def preflight_checks() -> Dict[str, str]:
+    """Run minimal diagnostics. Returns dict of status messages."""
+    results = {}
+    # Template presence
+    try:
+        if not TEMPLATE_PATH.exists():
+            results["template"] = "Template not found (input-template.pptx)."
+        else:
+            # Try opening template
+            _ = Presentation(str(TEMPLATE_PATH))
+            results["template"] = "OK"
+    except Exception:
+        results["template"] = "Template unreadable or not a valid .pptx."
+    # Remote CSV reachability
+    try:
+        m = http_get_bytes(DEFAULT_MASTER_URL)
+        results["master_csv"] = "OK" if m else "Unavailable"
+    except Exception:
+        results["master_csv"] = "Unavailable"
+    try:
+        mp = http_get_bytes(DEFAULT_MAPPING_URL)
+        results["mapping_csv"] = "OK" if mp else "Unavailable"
+    except Exception:
+        results["mapping_csv"] = "Unavailable"
+    return results
+
 # -----------------------------
 # Slide builders
 # -----------------------------
@@ -576,9 +603,21 @@ def safe_present(prs: Presentation) -> bytes:
     bio.seek(0)
     return bio.getvalue()
 
+
 if generate:
+    # Preflight diagnostics
+    diag = preflight_checks()
+    if diag.get("template") != "OK":
+        st.error("Template issue: " + diag.get("template", "Unknown"))
+    if diag.get("master_csv") != "OK":
+        st.warning("Master Data source not reachable. Proceeding without packshots.")
+    if diag.get("mapping_csv") != "OK":
+        st.warning("Mapping source not reachable. Proceeding without descriptions and new item mapping.")
+
     if not TEMPLATE_PATH.exists():
         st.error("Template file is missing in the repository: input-template.pptx")
+    elif diag.get("template") != "OK":
+        st.error("Template unreadable. Ensure it is a valid .pptx and not a .ppt or zipped file.")
     elif not st.session_state.uploads:
         st.error("Please upload at least one group file.")
     else:
@@ -621,5 +660,7 @@ if generate:
                 ppt_bytes = safe_present(prs)
                 st.success("Your presentation is ready")
                 st.download_button("Download Muuto_Settings.pptx", data=ppt_bytes, file_name=OUTPUT_NAME, mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
-        except Exception:
-            st.error("Something went wrong while generating the presentation. Check the template layouts and the input files, then try again.")
+        except Exception as e:
+            # Show clearer hints without internal paths
+            hint = "Template unreadable" if "PackageNotFoundError" in str(type(e)) else "Unexpected generation error"
+            st.error("Generation failed. " + hint + ". Check that the template is a valid .pptx and inputs are well-formed CSV/images.")
