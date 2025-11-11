@@ -1,20 +1,21 @@
 import io
 import re
-from typing import Dict, List, Optional, Tuple
-import streamlit as st
-import pandas as pd
-from PIL import Image
-from pptx import Presentation
-from pptx.util import Inches
-from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
-import requests
 import time
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
+import pandas as pd
+import requests
+import streamlit as st
+from PIL import Image
+from pptx import Presentation
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
+from pptx.util import Inches
+
 # -----------------------------
-# Constants and defaults
+# Konstanter
 # -----------------------------
-TEMPLATE_PATH = Path("input-template.pptx")  # fixed template in repo root
+TEMPLATE_PATH = Path("input-template.pptx")  # fast template i repoets rod
 DEFAULT_MASTER_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRdNwE1Q_aG3BntCZZPRIOgXEFJ5AHJxHmRgirMx2FJqfttgCZ8on-j1vzxM-muTTvtAHwc-ovDV1qF/pub?output=csv"
 DEFAULT_MAPPING_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQPRmVmc0LYISduQdJyfz-X3LJlxiEDCNwW53LhFsWp5fFDS8V669rCd9VGoygBZSAZXeSNZ5fquPen/pub?output=csv"
 OUTPUT_NAME = "Muuto_Settings.pptx"
@@ -25,7 +26,7 @@ MAX_IMAGE_PX = 1400
 JPEG_QUALITY = 85
 
 # -----------------------------
-# Utilities
+# Hjælpere
 # -----------------------------
 def clean_name(name: str) -> str:
     if name is None:
@@ -55,7 +56,7 @@ def set_text_preserve_format(shape, text: str):
         pass
 
 def build_shape_map(slide) -> Dict[str, list]:
-    mapping = {}
+    mapping: Dict[str, List] = {}
     for shape in slide.shapes:
         try:
             nm = clean_name(getattr(shape, "name", ""))
@@ -80,17 +81,17 @@ def add_picture_contain(slide, shape, image_bytes: bytes):
             frame_w = int(shape.width)
             frame_h = int(shape.height)
             s = min(frame_w / im.width, frame_h / im.height)
-            s = min(s, 1.0)  # do not upscale beyond current
+            s = min(s, 1.0)
             target_w = max(1, int(im.width * s))
             target_h = max(1, int(im.height * s))
 
-            out_buf = io.BytesIO()
-            im.resize((target_w, target_h), Image.LANCZOS).save(out_buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-            out_buf.seek(0)
+            buf = io.BytesIO()
+            im.resize((target_w, target_h), Image.LANCZOS).save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+            buf.seek(0)
 
             left = shape.left + int((shape.width - target_w) / 2)
             top = shape.top + int((shape.height - target_h) / 2)
-            slide.shapes.add_picture(out_buf, left, top, width=target_w, height=target_h)
+            slide.shapes.add_picture(buf, left, top, width=target_w, height=target_h)
     except Exception:
         return
 
@@ -123,7 +124,8 @@ def parse_csv_flex(buf: bytes) -> pd.DataFrame:
         {"sep": ",", "encoding": "utf-8"},
         {"sep": ";", "encoding": "utf-8"},
         {"sep": "\t", "encoding": "utf-8"},
-        {"sep": ",", "encoding": "latin-1"},
+        {"sep": "|", "encoding": "utf-8"},
+        {"sep": ",", "encoding": "utf-8-sig"},
         {"sep": ";", "encoding": "latin-1"},
     ]
     for c in candidates:
@@ -134,18 +136,13 @@ def parse_csv_flex(buf: bytes) -> pd.DataFrame:
     return pd.DataFrame()
 
 def group_key_from_filename(name: str) -> Tuple[str, str]:
-    base = Path(name).stem
-    # Prefer segment after " - " if present
-    if " - " in base:
-        prefix = base.split(" - ", 1)[1].strip()
-    else:
-        # fallback to last segment split on _ or -
-        parts = re.split(r"[-_]", base)
-        prefix = parts[-1].strip() if parts else base.strip()
-    lname = name.lower()
+    base = Path(name).stem  # uden extension
+    lname = base.lower()
+
+    # Type
     if "floorplan" in lname:
         t = "floorplan"
-    elif "linedrawing" in lname or "line_drawing" in lname:
+    elif "linedrawing" in lname or "line_drawing" in lname or "line drawing" in lname:
         t = "linedrawing"
     else:
         ext = Path(name).suffix.lower()
@@ -155,7 +152,18 @@ def group_key_from_filename(name: str) -> Tuple[str, str]:
             t = "render"
         else:
             t = "other"
-    return prefix, t
+
+    # Gruppens nøgle = delen efter " - " hvis til stede, ellers sidste segment
+    if " - " in base:
+        key = base.split(" - ", 1)[1]
+    else:
+        parts = re.split(r"[-_]", base)
+        key = parts[-1] if parts else base
+
+    # Fjern trailing markører som " floorplan" / " linedrawing"
+    key = re.sub(r"\s+(floorplan|line\s*drawing|linedrawing)$", "", key, flags=re.IGNORECASE).strip()
+
+    return key, t
 
 def base_before_dash(s: str) -> str:
     if not isinstance(s, str):
@@ -178,7 +186,7 @@ def ensure_presentation_from_path(path: Path) -> Presentation:
     return Presentation(str(path))
 
 # -----------------------------
-# Domain logic
+# Databehandling
 # -----------------------------
 def load_remote_csv(url: str) -> pd.DataFrame:
     content = http_get_bytes(url)
@@ -257,30 +265,25 @@ def normalize_mapping(df: pd.DataFrame) -> pd.DataFrame:
     out["NEW BASE"] = out["New Item No."].apply(base_before_dash)
     return out
 
-
 def normalize_pcon(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
 
-    # Normalize column keys for matching
     norm = {c: re.sub(r"[^a-z0-9]", "", c.lower()) for c in df.columns}
 
-    # Candidate keys for article number
+    # artikel
     article_col = None
     for c in df.columns:
         key = norm[c]
         if (
             key in {
-                "articleno","article","articlenumber","articleno",
-                "artno","artnr","artnumber","itemno","itemnumber","articlecode"
-            }
-            or ("article" in key and "no" in key)
-            or ("item" in key and "no" in key)
+                "articleno","article","articlenumber","artno","artnr","artnumber","itemno","itemnumber","articlecode"
+            } or ("article" in key and "no" in key) or ("item" in key and "no" in key)
         ):
             article_col = c
             break
 
-    # Candidate keys for quantity
+    # qty
     qty_col = None
     for c in df.columns:
         key = norm[c]
@@ -288,7 +291,6 @@ def normalize_pcon(df: pd.DataFrame) -> pd.DataFrame:
             qty_col = c
             break
 
-    # If we cannot find an article column, return empty to avoid exceptions
     if article_col is None:
         return pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
 
@@ -301,7 +303,6 @@ def normalize_pcon(df: pd.DataFrame) -> pd.DataFrame:
 
     out["ARTICLE_BASE"] = out["ARTICLE_NO"].apply(base_before_dash)
     return out[["ARTICLE_NO", "Quantity", "ARTICLE_BASE"]]
-
 
 def find_packshot_url(article_no: str, mapping_df: pd.DataFrame, master_df: pd.DataFrame) -> Optional[str]:
     if master_df is None or master_df.empty:
@@ -352,7 +353,7 @@ def chunk(lst, n):
         yield lst[i:i+n]
 
 # -----------------------------
-# Fallback slide creators
+# Fallback-slides
 # -----------------------------
 def get_blank_layout(prs: Presentation):
     for layout in prs.slide_layouts:
@@ -443,70 +444,28 @@ def create_productlist_slide_fallback(prs: Presentation,
         table.cell(r, 2).text = f"{row.ARTICLE_NO} / {new_item}" if new_item else f"{row.ARTICLE_NO}"
         r += 1
 
-
-def preflight_checks() -> Dict[str, str]:
-    """Run minimal diagnostics. Returns dict of status messages."""
-    results = {}
-    # Template presence
-    try:
-        if not TEMPLATE_PATH.exists():
-            results["template"] = "Template not found (input-template.pptx)."
-        else:
-            # Try opening template
-            _ = Presentation(str(TEMPLATE_PATH))
-            results["template"] = "OK"
-    except Exception:
-        results["template"] = "Template unreadable or not a valid .pptx."
-    # Remote CSV reachability
-    try:
-        m = http_get_bytes(DEFAULT_MASTER_URL)
-        results["master_csv"] = "OK" if m else "Unavailable"
-    except Exception:
-        results["master_csv"] = "Unavailable"
-    try:
-        mp = http_get_bytes(DEFAULT_MAPPING_URL)
-        results["mapping_csv"] = "OK" if mp else "Unavailable"
-    except Exception:
-        results["mapping_csv"] = "Unavailable"
-    return results
-
-
-def layout_has_expected(layout, keys: List[str]) -> bool:
-    try:
-        names = [clean_name(getattr(sh, "name", "")) for sh in layout.shapes]
-    except Exception:
-        names = []
-    for k in keys:
-        if clean_name(k) in names:
-            return True
-    # Sometimes layouts use identical names like {{Rendering}} for many shapes; accept "rendering" prefix
-    if any(n.startswith("rendering") for n in names):
-        return True
-    return False
-
 # -----------------------------
 # Slide builders
 # -----------------------------
-
 def build_overview_slides(prs: Presentation, overview_layout, rendering_bytes_list: List[bytes]):
     for batch in chunk(rendering_bytes_list, MAX_OVERVIEW_IMAGES):
         slide = prs.slides.add_slide(overview_layout)
         shape_map = build_shape_map(slide)
-        # Collect all shapes that look like rendering placeholders
+
+        # find alle shapes der ligner rendering-pladsholdere
         candidates = []
         for key, shapes in shape_map.items():
             if key.startswith("rendering"):
-                # add all with left/top order to keep layout grid
                 for sh in shapes:
-                    candidates.append((sh.left, sh.top, sh))
-        # sort by top then left
-        candidates.sort(key=lambda t: (int(t[1]), int(t[0])))
-        # place images sequentially
-        for (img_bytes, (_, _, target_shape)) in zip(batch, candidates):
-            if img_bytes:
-                add_picture_contain(slide, target_shape, img_bytes)
-        # if no explicit rendering placeholders, fall back to names Rendering1..Rendering12
-        if not candidates:
+                    candidates.append((int(sh.top), int(sh.left), sh))
+        candidates.sort(key=lambda t: (t[0], t[1]))
+
+        if candidates:
+            for (img_bytes, (_, __, target_shape)) in zip(batch, candidates):
+                if img_bytes:
+                    add_picture_contain(slide, target_shape, img_bytes)
+        else:
+            # fallback: prøv Rendering1..Rendering12
             for idx, img_bytes in enumerate(batch, start=1):
                 key = clean_name(f"Rendering{idx}")
                 if key in shape_map:
@@ -523,7 +482,8 @@ def build_setting_slide(prs: Presentation,
     slide = prs.slides.add_slide(setting_layout)
     shape_map = build_shape_map(slide)
     if clean_name("SETTINGNAME") in shape_map:
-        set_text_preserve_format(shape_map[clean_name("SETTINGNAME")][0], group_name)
+        for sh in shape_map[clean_name("SETTINGNAME")]:
+            set_text_preserve_format(sh, group_name)
     if clean_name("Rendering") in shape_map and render_bytes:
         add_picture_contain(slide, shape_map[clean_name("Rendering")][0], render_bytes)
     if clean_name("Linedrawing") in shape_map and floorplan_bytes:
@@ -549,11 +509,6 @@ def build_productlist_slide(prs: Presentation,
     shape_map = build_shape_map(slide)
     title_shapes = shape_map.get(clean_name("Title"), None)
     title_shape = title_shapes[0] if title_shapes else None
-    if title_shape is None:
-        for s in slide.shapes:
-            if hasattr(s, "text_frame") and s.text_frame:
-                title_shape = s
-                break
     if title_shape:
         set_text_preserve_format(title_shape, f"Products – {group_name}")
     anchors = shape_map.get(clean_name("TableAnchor"), None)
@@ -582,35 +537,65 @@ def build_productlist_slide(prs: Presentation,
         table.cell(r, 2).text = f"{row.ARTICLE_NO} / {new_item}" if new_item else f"{row.ARTICLE_NO}"
         r += 1
 
+def layout_has_expected(layout, keys: List[str]) -> bool:
+    try:
+        names = [clean_name(getattr(sh, "name", "")) for sh in layout.shapes]
+    except Exception:
+        names = []
+    for k in keys:
+        if clean_name(k) in names:
+            return True
+    if any(n.startswith("rendering") for n in names):
+        return True
+    return False
+
+def preflight_checks() -> Dict[str, str]:
+    results = {}
+    try:
+        if not TEMPLATE_PATH.exists():
+            results["template"] = "Template not found (input-template.pptx)."
+        else:
+            _ = Presentation(str(TEMPLATE_PATH))
+            results["template"] = "OK"
+    except Exception:
+        results["template"] = "Template unreadable or not a valid .pptx."
+
+    try:
+        m = http_get_bytes(DEFAULT_MASTER_URL)
+        results["master_csv"] = "OK" if m else "Unavailable"
+    except Exception:
+        results["master_csv"] = "Unavailable"
+    try:
+        mp = http_get_bytes(DEFAULT_MAPPING_URL)
+        results["mapping_csv"] = "OK" if mp else "Unavailable"
+    except Exception:
+        results["mapping_csv"] = "Unavailable"
+    return results
+
 # -----------------------------
-# App UI
+# UI
 # -----------------------------
 st.set_page_config(page_title="Muuto PowerPoint Generator", layout="centered")
 st.title("Muuto PowerPoint Generator")
 st.write("Upload your group files (CSV and images). The app uses a fixed PowerPoint template from the repo and fetches Master Data and Mapping from fixed URLs.")
 
-# Session state for uploads
 if "uploads" not in st.session_state:
-    st.session_state.uploads = []  # list of dict: {"name":..., "bytes":...}
+    st.session_state.uploads = []  # [{name, bytes}]
 
-# Upload widget
 files = st.file_uploader(
     "User group files (.csv, .jpg, .png). You can add multiple files.",
     type=["csv", "jpg", "jpeg", "png"],
     accept_multiple_files=True,
 )
-
 if files:
-    existing_names = {u["name"] for u in st.session_state.uploads}
+    existing = {u["name"] for u in st.session_state.uploads}
     for f in files:
-        if f.name not in existing_names:
+        if f.name not in existing:
             st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
-            existing_names.add(f.name)
+            existing.add(f.name)
 
-if not st.session_state.uploads:
-    st.info("No user group files uploaded yet.")
+# Vis kun Streamlits egen liste; ingen ekstra liste
 
-# Generate button
 generate = st.button("Generate presentation")
 
 def build_groups(upload_list: List[Dict]) -> Dict[str, Dict]:
@@ -632,11 +617,7 @@ def build_groups(upload_list: List[Dict]) -> Dict[str, Dict]:
     return groups
 
 def collect_all_renderings(groups: Dict[str, Dict]) -> List[bytes]:
-    lst = []
-    for g in groups.values():
-        if g.get("render"):
-            lst.append(g["render"])
-    return lst
+    return [g["render"] for g in groups.values() if g.get("render")]
 
 def safe_present(prs: Presentation) -> bytes:
     bio = io.BytesIO()
@@ -644,9 +625,7 @@ def safe_present(prs: Presentation) -> bytes:
     bio.seek(0)
     return bio.getvalue()
 
-
 if generate:
-    # Preflight diagnostics
     diag = preflight_checks()
     if diag.get("template") != "OK":
         st.error("Template issue: " + diag.get("template", "Unknown"))
@@ -658,22 +637,22 @@ if generate:
     if not TEMPLATE_PATH.exists():
         st.error("Template file is missing in the repository: input-template.pptx")
     elif diag.get("template") != "OK":
-        st.error("Template unreadable. Ensure it is a valid .pptx and not a .ppt or zipped file.")
+        st.error("Template unreadable. Ensure it is a valid .pptx.")
     elif not st.session_state.uploads:
         st.error("Please upload at least one group file.")
     else:
         try:
             with st.spinner("Work in progress…"):
                 prs = ensure_presentation_from_path(TEMPLATE_PATH)
+
                 overview_layout = find_layout_by_name(prs, "Overview") or find_layout_by_name(prs, "Renderings")
                 setting_layout = find_layout_by_name(prs, "Setting")
                 productlist_layout = find_layout_by_name(prs, "ProductListBlank")
+
                 groups = build_groups(st.session_state.uploads)
 
-                master_df = load_remote_csv(DEFAULT_MASTER_URL)
-                master_df = normalize_master(master_df)
-                mapping_df = load_remote_csv(DEFAULT_MAPPING_URL)
-                mapping_df = normalize_mapping(mapping_df)
+                master_df = normalize_master(load_remote_csv(DEFAULT_MASTER_URL))
+                mapping_df = normalize_mapping(load_remote_csv(DEFAULT_MAPPING_URL))
 
                 renders = collect_all_renderings(groups)
                 if renders:
@@ -692,11 +671,13 @@ if generate:
                         pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
                     if pcon_df.empty:
                         pcon_df = pd.DataFrame(columns=["ARTICLE_NO", "Quantity"])
-                    if setting_layout and layout_has_expected(setting_layout, ["SETTINGNAME","Rendering","ProductPackshot1"]):
+
+                    if setting_layout and layout_has_expected(setting_layout, ["SETTINGNAME", "Rendering", "ProductPackshot1"]):
                         build_setting_slide(prs, setting_layout, group_name, g.get("render"), g.get("floorplan"), pcon_df, mapping_df, master_df)
                     else:
                         create_setting_slide_fallback(prs, group_name, g.get("render"), g.get("floorplan"), pcon_df, mapping_df, master_df)
-                    if productlist_layout:
+
+                    if productlist_layout and layout_has_expected(productlist_layout, ["TableAnchor"]):
                         build_productlist_slide(prs, productlist_layout, group_name, pcon_df, mapping_df)
                     else:
                         create_productlist_slide_fallback(prs, group_name, pcon_df, mapping_df)
@@ -704,7 +685,5 @@ if generate:
                 ppt_bytes = safe_present(prs)
                 st.success("Your presentation is ready")
                 st.download_button("Download Muuto_Settings.pptx", data=ppt_bytes, file_name=OUTPUT_NAME, mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
-        except Exception as e:
-            # Show clearer hints without internal paths
-            hint = "Template unreadable" if "PackageNotFoundError" in str(type(e)) else "Unexpected generation error"
-            st.error("Generation failed. " + hint + ". Check that the template is a valid .pptx and inputs are well-formed CSV/images.")
+        except Exception:
+            st.error("Something went wrong while generating the presentation. Check the template and inputs, then try again.")
