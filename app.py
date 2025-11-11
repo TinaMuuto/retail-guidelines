@@ -141,14 +141,11 @@ def group_key_from_filename(name: str) -> Tuple[str, str]:
             t = "render"
         else:
             t = "other"
-    # Find the key by taking everything AFTER the first " - "
     if " - " in base:
         key = base.split(" - ", 1)[1]
-    # Fallback: find the key by taking the last part split by [- _]
     else:
         parts = re.split(r"[-_]", base)
         key = parts[-1] if parts else base
-    # Clean up the key by removing type markers (case-insensitive)
     key = re.sub(r"\s+(floorplan|line\s*drawing|linedrawing)$", "", key, flags=re.IGNORECASE).strip()
     return key, t
 
@@ -188,7 +185,6 @@ def normalize_master(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["ITEM NO.", "IMAGE"])
     
-    # Aggressive stripping of column names
     cols = {c: c.strip() for c in df.columns}
     df = df.rename(columns=cols)
     
@@ -210,7 +206,6 @@ def normalize_mapping(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["OLD Item-variant", "Description", "New Item No."])
     
-    # Aggressive stripping of column names
     cols = {c: c.strip() for c in df.columns}
     df = df.rename(columns=cols)
     
@@ -495,7 +490,7 @@ def create_productlist_slide_fallback(prs: Presentation,
     # Dummy anchor position used in fallback
     rows = max(1, len(products_df)) + 1
     cols = 3
-    table = add_table(slide, None, rows, cols) 
+    table = add_table(slide, None, rows, cols) # Sends None to use default dimensions in add_table
     
     if table is None:
         return
@@ -556,8 +551,7 @@ def build_setting_slide(prs: Presentation,
     if render_shape and render_bytes:
         add_picture_into_shape(slide, render_shape, render_bytes)
         
-    # Linedrawing check: safe_find_shape now handles the 'LlineDrawing' typo from your template
-    floorplan_shape = safe_find_shape(shape_map, "Linedrawing") 
+    floorplan_shape = safe_find_shape(shape_map, "Linedrawing")
     if floorplan_shape and floorplan_bytes:
         add_picture_into_shape(slide, floorplan_shape, floorplan_bytes)
         
@@ -568,7 +562,7 @@ def build_setting_slide(prs: Presentation,
         pack_url = find_packshot_url(article_no, mapping_df, master_df)
         img_bytes = http_get_bytes(pack_url) if pack_url else None
         
-        # a) Packshot image (safe_find_shape handles the PackshotX vs ProductPackshotX flexibility)
+        # a) Packshot image
         pic_key = clean_name(f"ProductPackshot{i}")
         pic_shape = safe_find_shape(shape_map, pic_key)
         
@@ -685,6 +679,7 @@ def build_groups(upload_list: List[Dict]) -> Dict[str, Dict]:
         if t == "csv":
             groups[key]["csv"] = b
         elif t == "render":
+            # The current logic prioritizes the first render/floorplan found.
             if groups[key]["render"] is None:
                 groups[key]["render"] = b
         elif t in ["floorplan", "linedrawing"]:
@@ -725,7 +720,6 @@ files = st.file_uploader(
 if files:
     existing = {u["name"] for u in st.session_state.uploads}
     for f in files:
-        # Check if file is already loaded to avoid reading heavy file multiple times
         if f.name not in existing:
             st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
             existing.add(f.name)
@@ -762,9 +756,13 @@ if generate:
                 # Build groups regardless of whether st.session_state.uploads is empty
                 groups = build_groups(st.session_state.uploads)
 
-                if not groups:
-                    st.error("Could not form any groups. Please ensure files are uploaded and filenames contain CSV and at least one image/floorplan.")
-                    
+                if not groups and st.session_state.uploads:
+                    # Specific error if files were uploaded but could not be grouped
+                    st.error("Could not form any groups. Please check if file names match the expected pattern (e.g., must contain ' - ').")
+                elif not groups:
+                     # General error if no files were uploaded at all
+                     st.error("Please upload at least one group file.")
+
                 # Continue only if groups were successfully formed
                 if groups:
                     prs = ensure_presentation_from_path(TEMPLATE_PATH)
@@ -845,4 +843,3 @@ if st.session_state.last_master_df is not None and st.session_state.last_mapping
     col_mp.metric("Mapping Data Rows", st.session_state.last_mapping_df.shape[0])
     if st.session_state.last_master_df.empty or st.session_state.last_mapping_df.empty:
         st.warning("WARNING: Zero rows loaded from Master/Mapping CSVs. Check URL accessibility.")
-```eof
