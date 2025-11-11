@@ -3,21 +3,19 @@ import re
 import time
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
-# from copy import deepcopy er fjernet, da den ikke blev brugt
-# typing.Any er fjernet for at rydde op
 
 import pandas as pd
 import requests
 import streamlit as st
 from PIL import Image
 from pptx import Presentation
-from pptx.util import Inches, Pt # Pt blev ikke brugt, men bibeholdes da det kan være et artefakt
+from pptx.util import Inches, Pt
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, PP_PLACEHOLDER
 
 # --- STREAMLIT CACHING DEKORATORER ---
-# Defineret her for bedre overblik og genbrug
-st.cache_data.clear() # Clear cache ved app start for udvikling
-st.cache_resource.clear() # Clear resource cache for prs template
+# Sørger for, at eksterne data og skabelon kun indlæses, når det er nødvendigt.
+# st.cache_data.clear() # Deaktiveret: Fjern denne linje i produktion
+# st.cache_resource.clear() # Deaktiveret: Fjern denne linje i produktion
 
 # ---------------------- Constants ----------------------
 TEMPLATE_PATH = Path("input-template.pptx")
@@ -40,7 +38,6 @@ def clean_name(name: str) -> str:
     if name is None:
         return ""
     name = name.strip()
-    # Bruger re.sub med en kompileret regex for at forbedre performance en smule
     name = re.sub(r"^\{\{|\}\}$", "", name).strip()
     return re.sub(r"\s+", "", name).lower()
 
@@ -66,18 +63,17 @@ def build_shape_map(slide) -> Dict[str, list]:
             if nm:
                 mapping.setdefault(nm, []).append(shape)
         except Exception:
-            # Ignorerer shapes uden navn
             continue
     return mapping
 
 def safe_find_shape(shape_map: Dict[str, list], key: str, index: int = 0) -> Optional[object]:
-    """Hjælpefunktion til sikkert at finde en shape ved dens rensede navn, med fleksibilitet (mindre skabelon-workarounds)."""
+    """Hjælpefunktion til sikkert at finde en shape ved dens rensede navn, med fleksibilitet."""
     clean_key = clean_name(key)
     
     if clean_key in shape_map and len(shape_map[clean_key]) > index:
         return shape_map[clean_key][index]
     
-    # Template Fleksibilitet Check: Kompenserer for almindelige slåfejl (beholdes for robusthed)
+    # Template Fleksibilitet Check (Workarounds for skabelon-typos)
     if clean_key.startswith("productpackshot"):
         alt_key = clean_key.replace("productpackshot", "packshot")
         if alt_key in shape_map and len(shape_map[alt_key]) > index:
@@ -90,7 +86,7 @@ def safe_find_shape(shape_map: Dict[str, list], key: str, index: int = 0) -> Opt
 
     return None
 
-# --- Utils - Network & Data Loading (Caching er tilføjet her) ---
+# --- Utils - Network & Data Loading (CACHED VERSION) ---
 
 def http_get_bytes(url: str) -> Optional[bytes]:
     """Henter indholdet af en URL med genforsøg og timeout."""
@@ -102,7 +98,7 @@ def http_get_bytes(url: str) -> Optional[bytes]:
             if resp.status_code == 200 and resp.content:
                 return resp.content
         except Exception:
-            pass # Fejlen ignoreres, da den logges i den kaldende funktion, hvis den er kritisk
+            pass 
         time.sleep(0.2 * attempt)
     return None
 
@@ -111,8 +107,8 @@ def parse_csv_flex(buf: bytes) -> pd.DataFrame:
     if buf is None:
         return pd.DataFrame()
     candidates = [
-        {"sep": ";", "encoding": "utf-8-sig"},  # CSV eksport fra DK-systemer
-        {"sep": ",", "encoding": "utf-8"},      # Standard CSV
+        {"sep": ";", "encoding": "utf-8-sig"},
+        {"sep": ",", "encoding": "utf-8"},
         {"sep": ";", "encoding": "utf-8"},
         {"sep": "\t", "encoding": "utf-8"},
         {"sep": ",", "encoding": "utf-8-sig"},
@@ -125,16 +121,26 @@ def parse_csv_flex(buf: bytes) -> pd.DataFrame:
             continue
     return pd.DataFrame()
 
-@st.cache_data(show_spinner="Indlæser og normaliserer Master/Mapping Data...")
-def load_remote_csv_and_normalize(url: str, normalizer_func) -> pd.DataFrame:
-    """Henter og normaliserer CSV fra en ekstern URL. Bruger caching."""
+
+@st.cache_data(show_spinner="Indlæser Master Data fra URL...")
+def load_and_normalize_master(url: str) -> pd.DataFrame:
+    """Henter, parser og normaliserer Master Data (IMAGE URLS). Bruger caching."""
     content = http_get_bytes(url)
     if content is None:
         return pd.DataFrame()
     df = parse_csv_flex(content)
-    return normalizer_func(df)
+    return normalize_master(df)
 
-# --- Utils - Data Normalization (Logikken er beholdt, da den er robust for Muuto-data) ---
+@st.cache_data(show_spinner="Indlæser Mapping Data fra URL...")
+def load_and_normalize_mapping(url: str) -> pd.DataFrame:
+    """Henter, parser og normaliserer Mapping Data (DESC/NEW ITEM NO). Bruger caching."""
+    content = http_get_bytes(url)
+    if content is None:
+        return pd.DataFrame()
+    df = parse_csv_flex(content)
+    return normalize_mapping(df)
+
+# --- Utils - Data Normalization ---
 
 def normalize_master(df: pd.DataFrame) -> pd.DataFrame:
     """Normaliserer Master Data (Packshot URLs)."""
@@ -276,7 +282,6 @@ def group_key_from_filename(name: str) -> Tuple[str, str]:
         parts = re.split(r"[-_]", base)
         key = parts[-1] if parts else base
         
-    # Renser nøglen for filtypebeskrivelser
     key = re.sub(r"\s+(floorplan|line\s*drawing|linedrawing)$", "", key, flags=re.IGNORECASE).strip()
     return key, t
 
@@ -292,7 +297,6 @@ def build_groups(upload_list: List[Dict]) -> Dict[str, Dict]:
             groups[key] = {"name": key, "csv": None, "render": None, "floorplan": None}
             
         if t == "csv":
-            # Hvis flere CSV'er matcher, beholdes den første/sidste. Her bibeholdes den sidste (standard)
             groups[key]["csv"] = b 
         elif t == "render":
             if groups[key]["render"] is None:
@@ -326,7 +330,6 @@ def set_text_preserve_format(shape, text: str):
             if run0:
                 run0.text = text
             else:
-                # Nogle former (f.eks. Placeholders) har ikke runs, men har tekst
                 shape.text_frame.text = text 
     except Exception:
         pass
@@ -341,41 +344,34 @@ def add_picture_contain(slide, shape, image_bytes: bytes):
         
         im = Image.open(io.BytesIO(image_bytes))
         
-        # Konverterer til RGB for at sikre kompatibilitet med JPEG-lagring
         if im.mode in ("RGBA", "LA", "P"):
               im = im.convert("RGB")
 
         w, h = im.size
         
-        # Nedskalerer store billeder (hvis de er over MAX_IMAGE_PX i dimension)
         max_dim = min(MAX_IMAGE_PX, max(w, h))
         scale_src_cap = min(1.0, max_dim / float(max(w, h)))
         if scale_src_cap < 1.0:
             im = im.resize((int(w * scale_src_cap), int(h * scale_src_cap)), Image.Resampling.LANCZOS)
             w, h = im.size
 
-        # Beregner contain-fit forholdet til shape
         frame_w = int(shape.width)
         frame_h = int(shape.height)
         
         s = min(frame_w / w, frame_h / h)
-        s = min(s, 1.0) # Sikrer ingen opskalering over 100%
+        s = min(s, 1.0)
         target_w = max(1, int(w * s))
         target_h = max(1, int(h * s))
 
-        # Gemmer billedet som JPEG i bufferen
         buf = io.BytesIO()
         im.resize((target_w, target_h), Image.Resampling.LANCZOS).save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
         buf.seek(0)
 
-        # Beregner centreret position
         left = shape.left + int((shape.width - target_w) / 2)
         top = shape.top + int((shape.height - target_h) / 2)
         
-        # Indsætter billedet
         slide.shapes.add_picture(buf, left, top, width=target_w, height=target_h)
         
-        # Fjerner den originale shape/placeholder, hvis den ikke er en rigtig placeholder
         try:
             if not getattr(shape, "is_placeholder", False):
                 shape.element.getparent().remove(shape.element)
@@ -469,7 +465,6 @@ def build_setting_slide(prs: Presentation,
         pic_shape = safe_find_shape(shape_map, pic_key)
         
         if pic_shape:
-            # Undgår at bruge caching her, da billed-URL'er potentielt er unikke og der er en grænse for cache størrelse
             img_bytes = http_get_bytes(pack_url) if pack_url else None
             if img_bytes:
                 add_picture_into_shape(slide, pic_shape, img_bytes)
@@ -513,7 +508,6 @@ def build_productlist_slide(prs: Presentation,
         return
         
     # 3. Fill Table
-    # Sætter header-tekst
     table.cell(0, 0).text = "Quantity"
     table.cell(0, 1).text = "Description"
     table.cell(0, 2).text = "Article No. / New Item No."
@@ -541,7 +535,7 @@ def chunk(lst, n):
         yield lst[i:i+n]
 
 def safe_present(prs: Presentation) -> bytes:
-    """GEMMER PRÆSENTATIONEN I EN IO.BYTESIO BUFFER OG RETURNERER BYTES. RETTELSE AF FEJL."""
+    """GEMMER PRÆSENTATIONEN I EN IO.BYTESIO BUFFER OG RETURNERER BYTES."""
     binary_stream = io.BytesIO()
     try:
         prs.save(binary_stream)
@@ -565,7 +559,6 @@ def find_layout_by_name(prs: Presentation, target: str):
     
     return None
 
-# Bruger st.cache_resource til at indlæse PowerPoint-skabelonen én gang
 @st.cache_resource
 def ensure_presentation_from_path(path: Path) -> Presentation:
     """Sikrer, at skabelonfilen eksisterer og kan indlæses ved hjælp af caching."""
@@ -591,7 +584,6 @@ def preflight_checks() -> Dict[str, str]:
         return results
     
     try:
-        # Indlæser skabelonen via cache for hurtighed
         prs = ensure_presentation_from_path(TEMPLATE_PATH) 
         
         # 1. Renderings Check
@@ -624,14 +616,14 @@ st.set_page_config(page_title="Muuto PowerPoint Generator", layout="centered")
 st.title("Muuto PowerPoint Generator")
 st.write("Upload dine gruppefiler (CSV og billeder). Appen bruger den faste PowerPoint-skabelon og henter Master Data og Mapping fra faste URLs.")
 
-# Session state initialisering (kun uploads beholdes her)
+# Session state initialisering (kun uploads)
 if "uploads" not in st.session_state:
     st.session_state.uploads = []
 
-# --- Data Caching Status (uden session state) ---
-master_df = load_remote_csv_and_normalize(DEFAULT_MASTER_URL, normalize_master)
-mapping_df = load_remote_csv_and_normalize(DEFAULT_MAPPING_URL, normalize_mapping)
-
+# --- Data Caching Status (Kald de rettede funktioner her) ---
+# Dette er løsningen på UnhashableParamError
+master_df = load_and_normalize_master(DEFAULT_MASTER_URL)
+mapping_df = load_and_normalize_mapping(DEFAULT_MAPPING_URL)
 
 files = st.file_uploader(
     "User group files (.csv, .jpg, .png, .webp). You can add multiple files.",
@@ -645,10 +637,9 @@ if files:
         if f.name not in existing:
             st.session_state.uploads.append({"name": f.name, "bytes": f.read()})
             existing.add(f.name)
-    # Tvinger en genkørsel efter upload
     st.rerun()
 
-# Single flat file list with remove buttons
+# Uploaded Files List
 if st.session_state.uploads:
     st.subheader("Uploaded Files")
     remove_indices = []
@@ -683,19 +674,18 @@ if generate:
                     st.error("Kunne ikke danne nogen grupper. Sørg for at filer er uploadet, og at filnavne indeholder CSV og mindst ét render/floorplan billede (adskilt af ' - ').")
                     
                 if groups:
-                    # Henter den cachede præsentation
                     prs = ensure_presentation_from_path(TEMPLATE_PATH)
 
                     overview_layout = find_layout_by_name(prs, "Renderings")
                     setting_layout = find_layout_by_name(prs, "Setting")
                     productlist_layout = find_layout_by_name(prs, "ProductListBlank")
                     
-                    # --- DIAGNOSTIK OG ADVARSLER (bruger de cachede DFs) ---
+                    # --- DIAGNOSTIK OG ADVARSLER (bruger cachede DFs) ---
                     if mapping_df.empty:
-                        st.warning("ADVARSEL: Mapping Data (Beskrivelser/Nye Artikelnumre) kunne IKKE indlæses.")
+                        st.warning("ADVARSEL: Mapping Data kunne IKKE indlæses.")
                     
                     if master_df.empty:
-                        st.warning("ADVARSEL: Master Data (Billed-URLs) kunne IKKE indlæses.")
+                        st.warning("ADVARSEL: Master Data kunne IKKE indlæses.")
                         
                     # 1. Overview Slides
                     renders = collect_all_renderings(groups)
